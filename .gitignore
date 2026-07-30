@@ -1,0 +1,17 @@
+/target/
+/.direnv/
+/result
+/result-*
+
+# Local diagnostics and profiling output
+*.log
+*.trace
+*.profraw
+/logs/
+
+# Local environment overrides
+.env
+.env.*
+
+# macOS metadata
+.DS_Store

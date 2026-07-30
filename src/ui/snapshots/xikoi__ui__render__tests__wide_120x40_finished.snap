@@ -1,0 +1,44 @@
+---
+source: src/ui/render.rs
+expression: "rendered(120, 40, |view|\n{\n    view.activity = ActivityState::Idle; view.status_message =\n    Some(\"LINK COMPLETE\");\n})"
+---
+ ╭ XIKOI // LINK ACTIVITY // NEURAL SIGNAL ───────────────────────────────────────────────────────────────────────────╮ 
+ │● LINK ONLINE  //  · ACTIVITY IDLE  //  LINK COMPLETE                                                               │ 
+ │    █ ▃                                                                                                             │ 
+ │  ▇ █ █ ▂                                                                                                           │ 
+ │  █▁█ █ █ ▆                                                                                                         │ 
+ │  ███▅█ █ █                                                                                                         │ 
+ │ ██████▄███▄                                                                                                        │ 
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ 
+ ╭ TRANSCRIPT // LOCAL CONTEXT ───────────────────────────────────────────────────────────────────────────────────────╮ 
+ │                                                                                                                    │ 
+ ││ let f = |x| x + 1;                                                                                                │ 
+ │                                                                                                                    │ 
+ │A lambda can be represented by a closure.                                                                           █ 
+ │                                                                                                                    █ 
+ ││ let f = |x| x + 1;                                                                                                █ 
+ │                                                                                                                    █ 
+ │A lambda can be represented by a closure.                                                                           █ 
+ │                                                                                                                    █ 
+ ││ let f = |x| x + 1;                                                                                                █ 
+ │                                                                                                                    █ 
+ │A lambda can be represented by a closure.                                                                           │ 
+ │                                                                                                                    │ 
+ ││ let f = |x| x + 1;                                                                                                │ 
+ │                                                                                                                    │ 
+ │A lambda can be represented by a closure.                                                                           │ 
+ │                                                                                                                    │ 
+ ││ let f = |x| x + 1;                                                                                                │ 
+ │                                                                                                                    │ 
+ ╰────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯ 
+ ╭ COMPOSE // ENTER SEND  ALT+ENTER NEWLINE ─────────────────────────────────────╮ ╭ SYSTEM TELEMETRY ────────────────╮ 
+ │                                                                               │ │MODEL         qwen3.5:9b          │ 
+ │                                                                               │ │BUILD         9B Q4_K_M           │ 
+ │                                                                               │ │SESSION       019fb1d4            │ 
+ │                                                                               │ │MEMORY  5.00 GiB  MAXCTX 32768    │ 
+ │                                                                               │ │TOKENS  P 1024 / O 128            │ 
+ │                                                                               │ │RATE    42.5 tok/s  TTFT 183ms    │ 
+ │                                                                               │ │TIME    LOAD 0.6s  TOTAL 3.4s     │ 
+ │ KEY ECHO ∿    ▄▄█▄█ ▄ ▄                                                       │ │CTX 1024/8192  12%  MAX 32768 ────│ 
+ ╰───────────────────────────────────────────────────────────────────────────────╯ ╰──────────────────────────────────╯ 
+  [Ctrl+K] MODELS  [Ctrl+O] SESSIONS  [F1] HELP  [F2] INSPECT  // qwen3.5:9b

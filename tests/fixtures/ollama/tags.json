@@ -1,0 +1,27 @@
+{
+  "models": [
+    {
+      "name": "qwen3:4b",
+      "model": "qwen3:4b",
+      "size": 2500000000,
+      "digest": "local-digest",
+      "details": {
+        "format": "gguf",
+        "family": "qwen3",
+        "parameter_size": "4.0B",
+        "quantization_level": "Q4_K_M"
+      },
+      "future_field": "ignored"
+    },
+    {
+      "name": "friendly-cloud-model",
+      "size": 0,
+      "remote_model": "gemma4:31b-cloud",
+      "remote_host": "https://ollama.com:443",
+      "details": {
+        "family": "gemma4"
+      }
+    }
+  ],
+  "future_top_level_field": {}
+}

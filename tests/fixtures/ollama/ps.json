@@ -1,0 +1,19 @@
+{
+  "models": [
+    {
+      "name": "qwen3:4b",
+      "model": "qwen3:4b",
+      "size": 2500000000,
+      "digest": "local-digest",
+      "details": {
+        "format": "gguf",
+        "family": "qwen3",
+        "parameter_size": "4.0B",
+        "quantization_level": "Q4_K_M"
+      },
+      "expires_at": "2026-07-30T13:15:00.123456+05:30",
+      "size_vram": 2500000000,
+      "context_length": 4096
+    }
+  ]
+}

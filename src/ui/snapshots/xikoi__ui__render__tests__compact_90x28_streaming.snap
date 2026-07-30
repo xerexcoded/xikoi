@@ -1,0 +1,32 @@
+---
+source: src/ui/render.rs
+expression: "rendered(90, 28, |_| {})"
+---
+╭ XIKOI // LINK ACTIVITY ────────────────────────────────────────────────────────────────╮
+│● LINK ONLINE  //  ∿ ACTIVITY STREAMING      ▁▆▃█▂▇ ▅▁▄                                 │
+╰────────────────────────────────────────────────────────────────────────────────────────╯
+╭ TRANSCRIPT // LOCAL CONTEXT ───────────────────────────────────────────────────────────╮
+│A lambda can be represented by a closure.                                               │
+│                                                                                        │
+││ let f = |x| x + 1;                                                                    │
+│                                                                                        │
+│A lambda can be represented by a closure.                                               █
+│                                                                                        █
+││ let f = |x| x + 1;                                                                    █
+│                                                                                        █
+│A lambda can be represented by a closure.                                               █
+│                                                                                        █
+││ let f = |x| x + 1;                                                                    │
+│                                                                                        │
+│A lambda can be represented by a closure.                                               │
+│                                                                                        │
+││ let f = |x| x + 1;                                                                    │
+│                                                                                        │
+╰────────────────────────────────────────────────────────────────────────────────────────╯
+╭ COMPOSE // ENTER SEND  ALT+ENTER NEWLINE ──────────────────────────────────────────────╮
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│ KEY ECHO ∿    ▄▄█▄█ ▄ ▄                                                                │
+╰────────────────────────────────────────────────────────────────────────────────────────╯
+ qwen3.5:9b // ∿ STREAMING  TOK pending  CTX pending/8192  [F2] INSPECT

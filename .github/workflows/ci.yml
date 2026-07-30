@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    name: ${{ matrix.system }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            system: x86_64-linux
+          - os: macos-15
+            system: aarch64-darwin
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Verify runner architecture
+        run: test "$(nix eval --impure --raw --expr builtins.currentSystem)" = "${{ matrix.system }}"
+
+      - name: Check formatting
+        if: matrix.system == 'x86_64-linux'
+        run: nix develop --command cargo fmt --check
+
+      - name: Evaluate every supported flake system
+        if: matrix.system == 'x86_64-linux'
+        run: nix flake check --all-systems --no-build
+
+      - name: Run Clippy
+        run: nix develop --command cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        run: nix develop --command cargo nextest run --all-features
+
+      - name: Check flake and package
+        run: nix flake check --print-build-logs
+
+      - name: Audit dependencies
+        if: matrix.system == 'x86_64-linux'
+        run: nix develop --command cargo audit

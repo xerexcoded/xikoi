@@ -1,0 +1,21 @@
+{
+  "details": {
+    "format": "gguf",
+    "family": "qwen3",
+    "parameter_size": "4.0B",
+    "quantization_level": "Q4_K_M"
+  },
+  "capabilities": [
+    "completion",
+    "tools",
+    "thinking"
+  ],
+  "model_info": {
+    "general.architecture": "qwen3",
+    "qwen3.context_length": 262144,
+    "vision.context_length": 8192,
+    "future.metadata": "ignored"
+  },
+  "template": "ignored by the client",
+  "license": "fixture"
+}
