@@ -1,5 +1,7 @@
 # Xikoi
 
+![](xikoi.png)
+
 Xikoi is a local-first terminal interface for talking to models served by
 [Ollama](https://ollama.com). It is written in Rust with
 [Ratatui](https://ratatui.rs) and designed first for Apple Silicon Macs.
@@ -66,6 +68,11 @@ enabled globally, use:
 ```sh
 nix --extra-experimental-features 'nix-command flakes' develop
 ```
+
+Zed integration is configured in `.zed/settings.json`. It asks Zed to load
+the project's direnv shell and use the flake-provided `rust-analyzer` and
+`nixd` binaries. Restart the language servers from Zed's command palette after
+first allowing direnv.
 
 Start Xikoi with the model picker:
 
