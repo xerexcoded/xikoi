@@ -147,11 +147,10 @@
               pkgs.nixfmt
               pkgs.curl
               pkgs.jq
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-              pkgs.alsa-lib
-              pkgs.pkg-config
             ];
+
+            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.pkg-config ];
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
 
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
             RUST_BACKTRACE = "1";
@@ -170,11 +169,10 @@
               pkgs.python312
               pkgs.curl
               pkgs.jq
-            ]
-            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-              pkgs.alsa-lib
-              pkgs.pkg-config
             ];
+
+            nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.pkg-config ];
+            buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
 
             UV_PYTHON = "${pkgs.python312}/bin/python";
             UV_PYTHON_DOWNLOADS = "never";
