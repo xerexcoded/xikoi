@@ -112,6 +112,108 @@ impl OllamaBackend {
             ),
         }
     }
+
+    pub async fn pull_model<F>(&self, model: &str, mut on_progress: F) -> Result<(), BackendFailure>
+    where
+        F: FnMut(&PullProgress),
+    {
+        let response = self
+            .client
+            .post(self.endpoint("api/pull")?)
+            .json(&PullRequest {
+                model,
+                stream: true,
+            })
+            .send()
+            .await
+            .map_err(|error| self.transport_failure(&error))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .bytes()
+                .await
+                .map_err(|error| self.transport_failure(&error))?;
+            return Err(status_failure(status, &body));
+        }
+
+        let mut stream = response.bytes_stream();
+        let mut framer = NdjsonFramer::default();
+        let mut completed = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| self.transport_failure(&error))?;
+            for line in framer.push(&chunk)? {
+                completed |= consume_pull_record(&line, &mut on_progress)?;
+            }
+        }
+        if let Some(line) = framer.finish()? {
+            completed |= consume_pull_record(&line, &mut on_progress)?;
+        }
+        if completed {
+            Ok(())
+        } else {
+            Err(protocol_failure(
+                "the Ollama pull response ended before status=success".to_owned(),
+            ))
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PullProgress {
+    pub status: String,
+    pub completed: Option<u64>,
+    pub total: Option<u64>,
+}
+
+impl PullProgress {
+    #[allow(clippy::cast_precision_loss)]
+    pub fn fraction(&self) -> Option<f64> {
+        let completed = self.completed?;
+        let total = self.total?;
+        if total == 0 {
+            return None;
+        }
+        Some((completed as f64 / total as f64).clamp(0.0, 1.0))
+    }
+}
+
+#[derive(Serialize)]
+struct PullRequest<'a> {
+    model: &'a str,
+    stream: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct PullWireChunk {
+    status: String,
+    completed: Option<u64>,
+    total: Option<u64>,
+    error: Option<String>,
+}
+
+fn consume_pull_record<F>(line: &[u8], on_progress: &mut F) -> Result<bool, BackendFailure>
+where
+    F: FnMut(&PullProgress),
+{
+    let chunk: PullWireChunk = serde_json::from_slice(line)
+        .map_err(|error| protocol_failure(format!("invalid Ollama pull record: {error}")))?;
+    if let Some(error) = chunk.error {
+        return Err(wire_error_failure(None, error));
+    }
+    if chunk.status.trim().is_empty() {
+        return Err(protocol_failure(
+            "Ollama returned a pull record without status".to_owned(),
+        ));
+    }
+    let progress = PullProgress {
+        status: chunk.status,
+        completed: chunk.completed,
+        total: chunk.total,
+    };
+    let complete = progress.status.eq_ignore_ascii_case("success");
+    on_progress(&progress);
+    Ok(complete)
 }
 
 #[async_trait]
@@ -742,6 +844,37 @@ mod tests {
 
         assert_eq!(info.version, "0.12.6");
         assert_eq!(info.endpoint, server.uri());
+    }
+
+    #[tokio::test]
+    async fn pulls_a_model_and_reports_streamed_progress() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/pull"))
+            .and(body_json(json!({
+                "model": "qwen3:1.7b",
+                "stream": true
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                concat!(
+                    "{\"status\":\"pulling manifest\"}\n",
+                    "{\"status\":\"downloading\",\"completed\":50,\"total\":100}\n",
+                    "{\"status\":\"success\"}\n"
+                ),
+                "application/x-ndjson",
+            ))
+            .mount(&server)
+            .await;
+
+        let mut progress = Vec::new();
+        backend(&server)
+            .pull_model("qwen3:1.7b", |update| progress.push(update.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(progress.len(), 3);
+        assert_eq!(progress[1].fraction(), Some(0.5));
+        assert_eq!(progress[2].status, "success");
     }
 
     #[tokio::test]

@@ -11,11 +11,11 @@ use ratatui::{
     },
 };
 
-use crate::domain::ChatMessage;
+use crate::{audio::AudioDirection, domain::ChatMessage};
 
 use super::{
-    ActivityState, HelpBinding, ModelChoice, OverlayView, SessionChoice, TelemetryView, Theme,
-    UiView, markdown::message_lines, wrap_lines,
+    ActivityState, AudioChoice, HelpBinding, InteractionMode, ModelChoice, OverlayView,
+    SessionChoice, TelemetryView, Theme, UiView, VoiceState, markdown::message_lines, wrap_lines,
 };
 
 const WIDE_MIN_WIDTH: u16 = 110;
@@ -239,6 +239,13 @@ fn activity_status_spans(
             theme.activity_style(view.activity),
         ),
     ];
+    if view.voice.mode == InteractionMode::Voice {
+        spans.push(Span::styled("  //  ".to_owned(), theme.muted));
+        spans.push(Span::styled(
+            format!("VOICE {}", view.voice.state.label()),
+            theme.activity_style(view.activity),
+        ));
+    }
     if include_message && let Some(message) = view.status_message {
         spans.push(Span::styled("  //  ".to_owned(), theme.muted));
         spans.push(Span::styled(
@@ -380,6 +387,11 @@ fn render_input(
         return;
     }
 
+    if view.voice.mode == InteractionMode::Voice {
+        render_voice_deck(frame, inner, view, theme);
+        return;
+    }
+
     if !show_signal || view.input_signal_samples.is_empty() || inner.height < 2 {
         frame.render_widget(view.input, inner);
     } else {
@@ -388,6 +400,56 @@ fn render_input(
         frame.render_widget(view.input, composer);
         render_input_signal(frame, input_signal, view.input_signal_samples, theme);
     }
+}
+
+fn render_voice_deck(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, theme: Theme) {
+    let signal = if matches!(
+        view.voice.state,
+        VoiceState::Speaking | VoiceState::Synthesizing
+    ) {
+        view.link_signal_samples
+    } else {
+        view.input_signal_samples
+    };
+    let waveform = ascii_signal(signal, usize::from(area.width.saturating_sub(4)));
+    let state_style = if view.voice.state == VoiceState::Failed {
+        theme.danger
+    } else if matches!(
+        view.voice.state,
+        VoiceState::Listening | VoiceState::Speaking
+    ) {
+        theme.accent
+    } else {
+        theme.secondary
+    };
+    let server = if view.voice.speech_online {
+        "MLX ONLINE"
+    } else {
+        "MLX OFFLINE"
+    };
+    let compact = area.height < 4;
+    let mut lines = vec![Line::from(vec![
+        Span::styled(" NEURAL VOICE // ", theme.muted),
+        Span::styled(view.voice.state.label().to_owned(), state_style),
+        Span::styled(format!(" // {server}"), theme.muted),
+    ])];
+    if compact {
+        lines.push(Line::styled(waveform, state_style));
+    } else {
+        let core = if theme.ascii {
+            format!(" <[{waveform}]> ")
+        } else {
+            format!(" ◢◤ {waveform} ◥◣ ")
+        };
+        lines.push(Line::styled(core, state_style).alignment(Alignment::Center));
+        lines.push(Line::from(vec![
+            Span::styled(" MIC ", theme.muted),
+            Span::styled(view.voice.input_device.to_owned(), theme.text),
+            Span::styled("  //  OUT ", theme.muted),
+            Span::styled(view.voice.output_device.to_owned(), theme.text),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines).style(theme.panel), area);
 }
 
 fn render_input_signal(frame: &mut Frame<'_>, area: Rect, samples: &[u64], theme: Theme) {
@@ -516,7 +578,7 @@ fn render_footer(
     let line = match class {
         LayoutClass::Wide => Line::from(vec![
             Span::styled(
-                " [Ctrl+K] MODELS  [Ctrl+O] SESSIONS  [F1] HELP  [F2] INSPECT ",
+                " [F3] VOICE  [F4] AUDIO  [Ctrl+K] MODELS  [Ctrl+O] SESSIONS  [F1] HELP  [F2] INSPECT ",
                 theme.muted,
             ),
             Span::styled(" // ", theme.border),
@@ -591,6 +653,7 @@ fn render_overlay(
         OverlayView::Models { .. } => (" MODEL MATRIX ", 18),
         OverlayView::Sessions { .. } => (" SESSION ARCHIVE ", 18),
         OverlayView::Help { .. } => (" COMMAND LEXICON ", 18),
+        OverlayView::Audio { .. } => (" AUDIO MATRIX // CORE AUDIO ", 20),
         OverlayView::Inspector => (" SYSTEM INSPECTOR ", 20),
     };
     let popup = centered_popup(area, 76, maximum_height);
@@ -617,8 +680,55 @@ fn render_overlay(
             render_session_overlay(frame, inner, items, selected, theme);
         }
         OverlayView::Help { bindings } => render_help_overlay(frame, inner, bindings, theme),
+        OverlayView::Audio { items, selected } => {
+            render_audio_overlay(frame, inner, items, selected, theme);
+        }
         OverlayView::Inspector => render_inspector(frame, inner, telemetry, activity, theme),
     }
+}
+
+fn render_audio_overlay(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    items: &[AudioChoice<'_>],
+    selected: usize,
+    theme: Theme,
+) {
+    let [list_area, footer] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No host audio devices are currently exposed.")
+                .style(theme.warning)
+                .alignment(Alignment::Center),
+            list_area,
+        );
+    } else {
+        let rows = items.iter().map(|item| {
+            let kind = match item.direction {
+                AudioDirection::Input => "MIC",
+                AudioDirection::Output => "OUT",
+            };
+            let active = if item.is_selected { "ACTIVE" } else { "      " };
+            let default = if item.is_default { " DEFAULT" } else { "" };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("[{kind}] "), theme.accent),
+                Span::styled(format!("{:<32}", item.name), theme.text),
+                Span::styled(format!(" {active:<6}"), theme.secondary),
+                Span::styled(format!("  {}{default}", item.detail), theme.muted),
+            ]))
+        });
+        let list = List::new(rows)
+            .highlight_style(theme.selected)
+            .highlight_symbol(if theme.ascii { "> " } else { "λ " });
+        let mut state = ListState::default();
+        state.select(Some(selected.min(items.len().saturating_sub(1))));
+        frame.render_stateful_widget(list, list_area, &mut state);
+    }
+    frame.render_widget(
+        Paragraph::new("UP/DOWN CHOOSE  ENTER ROUTE  R REFRESH  ESC CLOSE").style(theme.muted),
+        footer,
+    );
 }
 
 fn render_model_overlay(
@@ -633,7 +743,7 @@ fn render_model_overlay(
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new("No installed models. Run: ollama pull <model>, then Ctrl+R.")
+            Paragraph::new("No installed models. For Ollama: ollama pull <model>; then Ctrl+R.")
                 .style(theme.warning)
                 .alignment(Alignment::Center),
             list_area,
@@ -757,9 +867,9 @@ fn render_inspector(
     frame.render_widget(Paragraph::new(lines).style(theme.panel), details);
     render_context_gauge(frame, gauge, telemetry, activity, theme);
     let footer_text = if metrics_pending(activity) {
-        "ESC CLOSE  //  token metrics pending Ollama's final stream record"
+        "ESC CLOSE  //  token metrics pending the backend's final stream record"
     } else {
-        "ESC CLOSE  //  exact values from Ollama's final stream record"
+        "ESC CLOSE  //  exact values from the backend's final stream record"
     };
     frame.render_widget(Paragraph::new(footer_text).style(theme.muted), footer);
 }
@@ -1172,11 +1282,13 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
+        audio::AudioDirection,
         config::ColorMode,
         domain::{ChatMessage, MessageOrigin, MessageStatus, Role},
         ui::{
-            ActivityState, HelpBinding, LinkState, ModelChoice, OverlayView, SessionChoice,
-            TelemetryView, ThemeOptions, TranscriptScroll, UiView,
+            ActivityState, AudioChoice, HelpBinding, InteractionMode, LinkState, ModelChoice,
+            OverlayView, SessionChoice, TelemetryView, ThemeOptions, TranscriptScroll, UiView,
+            VoiceState, VoiceView,
         },
     };
 
@@ -1329,6 +1441,25 @@ mod tests {
     }
 
     #[test]
+    fn voice_deck_exposes_real_voice_state_and_routes() {
+        let output = rendered(120, 40, |view| {
+            view.voice = VoiceView {
+                mode: InteractionMode::Voice,
+                state: VoiceState::Listening,
+                speech_online: true,
+                input_device: "MacBook Air Microphone",
+                output_device: "MacBook Air Speakers",
+                asr_model: "qwen-asr",
+                tts_model: "qwen-tts",
+            };
+        });
+        assert!(output.contains("VOICE USER SPEAKING"));
+        assert!(output.contains("NEURAL VOICE"));
+        assert!(output.contains("MacBook Air Microphone"));
+        assert!(output.contains("MacBook Air Speakers"));
+    }
+
+    #[test]
     fn all_overlay_states_render_on_the_compact_layout() {
         static MODELS: [ModelChoice<'static>; 2] = [
             ModelChoice {
@@ -1352,6 +1483,24 @@ mod tests {
             keys: "Ctrl+K",
             action: "clear composer",
         }];
+        static AUDIO: [AudioChoice<'static>; 2] = [
+            AudioChoice {
+                id: "coreaudio:mic",
+                name: "Studio Microphone",
+                detail: "1ch · 48.0 kHz",
+                direction: AudioDirection::Input,
+                is_default: true,
+                is_selected: true,
+            },
+            AudioChoice {
+                id: "coreaudio:out",
+                name: "Multi-Output Device",
+                detail: "2ch · 48.0 kHz",
+                direction: AudioDirection::Output,
+                is_default: false,
+                is_selected: true,
+            },
+        ];
 
         let models_output = rendered(90, 28, |view| {
             view.overlay = Some(OverlayView::Models {
@@ -1400,6 +1549,16 @@ mod tests {
         assert!(help_output.contains("COMMAND LEXICON"));
         assert!(help_output.contains("clear composer"));
         assert!(help_output.contains("F1 / ESC CLOSE"));
+
+        let audio_output = rendered(90, 28, |view| {
+            view.overlay = Some(OverlayView::Audio {
+                items: &AUDIO,
+                selected: 1,
+            });
+        });
+        assert!(audio_output.contains("AUDIO MATRIX"));
+        assert!(audio_output.contains("Studio Microphone"));
+        assert!(audio_output.contains("Multi-Output Device"));
 
         let inspector_output = rendered(90, 28, |view| {
             view.activity = ActivityState::Idle;

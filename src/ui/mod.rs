@@ -9,7 +9,7 @@ mod theme;
 
 use ratatui_textarea::TextArea;
 
-use crate::{config::ColorMode, domain::ChatMessage};
+use crate::{audio::AudioDirection, config::ColorMode, domain::ChatMessage};
 
 pub use markdown::{markdown_lines, message_lines, wrap_lines};
 pub use render::{LayoutClass, layout_class, render};
@@ -53,6 +53,75 @@ impl ActivityState {
             Self::Streaming => "STREAMING",
             Self::Cancelling => "CANCELLING",
             Self::Failed => "ERROR",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum InteractionMode {
+    #[default]
+    Typing,
+    Voice,
+}
+
+impl InteractionMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Typing => "TYPE",
+            Self::Voice => "VOICE",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum VoiceState {
+    #[default]
+    Disarmed,
+    Ready,
+    Listening,
+    Transcribing,
+    Thinking,
+    Synthesizing,
+    Speaking,
+    Failed,
+}
+
+impl VoiceState {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Disarmed => "DISARMED",
+            Self::Ready => "READY",
+            Self::Listening => "USER SPEAKING",
+            Self::Transcribing => "TRANSCRIBING",
+            Self::Thinking => "AI THINKING",
+            Self::Synthesizing => "SYNTHESIZING",
+            Self::Speaking => "AI SPEAKING",
+            Self::Failed => "VOICE ERROR",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VoiceView<'a> {
+    pub mode: InteractionMode,
+    pub state: VoiceState,
+    pub speech_online: bool,
+    pub input_device: &'a str,
+    pub output_device: &'a str,
+    pub asr_model: &'a str,
+    pub tts_model: &'a str,
+}
+
+impl Default for VoiceView<'_> {
+    fn default() -> Self {
+        Self {
+            mode: InteractionMode::Typing,
+            state: VoiceState::Disarmed,
+            speech_online: false,
+            input_device: "SYSTEM DEFAULT",
+            output_device: "SYSTEM DEFAULT",
+            asr_model: "UNAVAILABLE",
+            tts_model: "UNAVAILABLE",
         }
     }
 }
@@ -149,6 +218,16 @@ pub struct HelpBinding<'a> {
     pub action: &'a str,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AudioChoice<'a> {
+    pub id: &'a str,
+    pub name: &'a str,
+    pub detail: &'a str,
+    pub direction: AudioDirection,
+    pub is_default: bool,
+    pub is_selected: bool,
+}
+
 /// Modal content drawn above the current layout.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OverlayView<'a> {
@@ -163,6 +242,10 @@ pub enum OverlayView<'a> {
     },
     Help {
         bindings: &'a [HelpBinding<'a>],
+    },
+    Audio {
+        items: &'a [AudioChoice<'a>],
+        selected: usize,
     },
     /// Shows the same complete telemetry used by the wide lower-right pane.
     Inspector,
@@ -182,6 +265,7 @@ pub struct UiView<'a, 'input> {
     pub activity: ActivityState,
     pub status_message: Option<&'a str>,
     pub telemetry: TelemetryView<'a>,
+    pub voice: VoiceView<'a>,
     /// Rolling Ollama/link activity samples. Values are normalized at render.
     pub link_signal_samples: &'a [u64],
     /// Rolling composer activity samples, such as recent keystroke energy.
@@ -205,6 +289,7 @@ impl<'a, 'input> UiView<'a, 'input> {
             activity: ActivityState::default(),
             status_message: None,
             telemetry,
+            voice: VoiceView::default(),
             link_signal_samples: &[],
             input_signal_samples: &[],
             transcript_scroll: TranscriptScroll::following_tail(),

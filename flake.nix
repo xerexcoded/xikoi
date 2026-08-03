@@ -1,5 +1,5 @@
 {
-  description = "Xikoi — a local-first neuromancer terminal for Ollama";
+  description = "Xikoi — a local-first neuromancer voice terminal";
 
   inputs = {
     # Current nixpkgs-unstable revision, verified on aarch64-darwin.
@@ -16,7 +16,7 @@
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
-  
+
   outputs =
     {
       self,
@@ -70,6 +70,9 @@
           cargoLock.lockFile = ./Cargo.lock;
           strictDeps = true;
 
+          nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.pkg-config ];
+          buildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux [ pkgs.alsa-lib ];
+
           meta = {
             description = manifest.package.description;
             mainProgram = "xikoi";
@@ -92,16 +95,36 @@
       apps = forAllSystems (
         system:
         let
+          pkgs = pkgsFor system;
           package = packageFor system;
           app = {
             type = "app";
             program = "${package}/bin/xikoi";
             meta.description = manifest.package.description;
           };
+          voiceServer = pkgs.writeShellApplication {
+            name = "xikoi-voice-server";
+            runtimeInputs = [
+              pkgs.uv
+              pkgs.python312
+            ];
+            text = ''
+              if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
+                echo "MLX-Audio requires Apple Silicon macOS." >&2
+                exit 1
+              fi
+              exec uv run --frozen --project . mlx_audio.server --host 127.0.0.1 --port 8000 "$@"
+            '';
+          };
         in
         {
           default = app;
           xikoi = app;
+          voice-server = {
+            type = "app";
+            program = "${voiceServer}/bin/xikoi-voice-server";
+            meta.description = "Run Xikoi's pinned local MLX-Audio inference server";
+          };
         }
       );
 
@@ -124,8 +147,37 @@
               pkgs.nixfmt
               pkgs.curl
               pkgs.jq
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.alsa-lib
+              pkgs.pkg-config
             ];
 
+            RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
+            RUST_BACKTRACE = "1";
+          };
+
+          voice = pkgs.mkShell {
+            strictDeps = true;
+
+            packages = [
+              toolchain
+              pkgs.cargo-edit
+              pkgs.cargo-nextest
+              pkgs.nil
+              pkgs.nixfmt
+              pkgs.uv
+              pkgs.python312
+              pkgs.curl
+              pkgs.jq
+            ]
+            ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+              pkgs.alsa-lib
+              pkgs.pkg-config
+            ];
+
+            UV_PYTHON = "${pkgs.python312}/bin/python";
+            UV_PYTHON_DOWNLOADS = "never";
             RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
             RUST_BACKTRACE = "1";
           };

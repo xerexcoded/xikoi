@@ -41,4 +41,4 @@ expression: "rendered(120, 40, |view|\n{\n    view.activity = ActivityState::Idl
  │                                                                               │ │TIME    LOAD 0.6s  TOTAL 3.4s     │ 
  │ KEY ECHO ∿    ▄▄█▄█ ▄ ▄                                                       │ │CTX 1024/8192  12%  MAX 32768 ────│ 
  ╰───────────────────────────────────────────────────────────────────────────────╯ ╰──────────────────────────────────╯ 
-  [Ctrl+K] MODELS  [Ctrl+O] SESSIONS  [F1] HELP  [F2] INSPECT  // qwen3.5:9b
+  [F3] VOICE  [F4] AUDIO  [Ctrl+K] MODELS  [Ctrl+O] SESSIONS  [F1] HELP  [F2] INSPECT  // qwen3.5:9b
