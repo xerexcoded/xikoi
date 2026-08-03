@@ -43,7 +43,8 @@ jobs:
           mkdir -p dist/stage
           cp target/release/xikoi LICENSE-APACHE LICENSE-MIT README.md dist/stage/
           tar -czf "dist/xikoi-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" -C dist/stage .
-          shasum -a 256 "dist/xikoi-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" > dist/SHA256SUMS
+          cd dist
+          shasum -a 256 "xikoi-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" > SHA256SUMS
 
       - name: Upload artifact to tagged GitHub release
         env:
