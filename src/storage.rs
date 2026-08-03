@@ -508,6 +508,7 @@ mod tests {
         let state = AppStateFile {
             last_model: Some("qwen".to_owned()),
             recent_session: Some(Uuid::now_v7().to_string()),
+            ..AppStateFile::default()
         };
         storage.save_state(&state).await.unwrap();
 

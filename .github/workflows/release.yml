@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  macos-artifact:
+    runs-on: macos-15
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v6
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = arm64
+
+      - name: Test release source
+        run: cargo test --locked --all-features
+
+      - name: Build portable release binary
+        run: cargo build --locked --release
+
+      - name: Verify system-only dynamic libraries
+        run: |
+          otool -L target/release/xikoi
+          if otool -L target/release/xikoi | grep -E '/nix/store|/opt/homebrew|/usr/local'; then
+            echo "release binary contains a non-system dynamic-library path" >&2
+            exit 1
+          fi
+
+      - name: Package release artifact
+        run: |
+          mkdir -p dist/stage
+          cp target/release/xikoi LICENSE-APACHE LICENSE-MIT README.md dist/stage/
+          tar -czf "dist/xikoi-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" -C dist/stage .
+          shasum -a 256 "dist/xikoi-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz" > dist/SHA256SUMS
+
+      - name: Upload artifact to tagged GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/xikoi-*.tar.gz dist/SHA256SUMS \
+            --verify-tag \
+            --title "Xikoi ${GITHUB_REF_NAME}" \
+            --generate-notes

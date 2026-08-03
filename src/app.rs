@@ -18,16 +18,24 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    audio::{
+        AudioDevice, AudioDirection, AudioInventory, CaptureSession, PlaybackSession,
+        QWEN_TTS_SAMPLE_RATE,
+    },
     backend::ChatBackend,
-    config::{AppStateFile, RuntimeConfig},
+    config::{AppStateFile, BackendKind, RuntimeConfig},
     domain::{
         BackendFailure, BackendInfo, ChatEvent, ChatMessage, ChatRequest, GenerationOptions,
-        MessageStatus, ModelSummary, SelectedModel, Usage,
+        MessageOrigin, MessageStatus, ModelSummary, SelectedModel, Usage,
+    },
+    speech::{
+        MlxAudioClient, SpeechFailure, SpeechServerInfo, SynthesisRequest, TranscriptionRequest,
     },
     storage::{LoadedSession, SessionSummary, Storage},
     ui::{
-        self, ActivityState, HelpBinding, LinkState, ModelChoice, OverlayView, SessionChoice,
-        TelemetryView, ThemeOptions, TranscriptScroll, UiView,
+        self, ActivityState, AudioChoice, HelpBinding, InteractionMode, LinkState, ModelChoice,
+        OverlayView, SessionChoice, TelemetryView, ThemeOptions, TranscriptScroll, UiView,
+        VoiceState, VoiceView,
     },
 };
 
@@ -43,6 +51,7 @@ enum Overlay {
     Sessions,
     Help,
     Inspector,
+    Audio,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +70,10 @@ enum InternalEvent {
     BackendOffline(BackendFailure),
     ModelHydrated(Box<ModelHydration>),
     Chat(ChatEvent),
+    SpeechProbe(Result<SpeechServerInfo, String>),
+    Transcription(Result<String, String>),
+    TtsChunk(Vec<u8>),
+    TtsFinished(Result<(), String>),
 }
 
 struct ModelHydration {
@@ -70,10 +83,12 @@ struct ModelHydration {
 }
 
 /// The single owner of terminal-facing and conversation state.
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     config: RuntimeConfig,
     storage: Storage,
     backend: Arc<dyn ChatBackend>,
+    speech: Arc<MlxAudioClient>,
     persisted: AppStateFile,
     session: LoadedSession,
     sessions: Vec<SessionSummary>,
@@ -83,6 +98,14 @@ pub struct App {
     input: TextArea<'static>,
     link: LinkState,
     activity: ActivityState,
+    voice_mode: bool,
+    voice_state: VoiceState,
+    speech_online: bool,
+    audio_inventory: AudioInventory,
+    capture: Option<CaptureSession>,
+    playback: Option<PlaybackSession>,
+    voice_cancel: Option<CancellationToken>,
+    tts_response_finished: bool,
     status: Option<String>,
     overlay: Option<Overlay>,
     overlay_index: usize,
@@ -94,7 +117,9 @@ pub struct App {
     generation_started: Option<Instant>,
     generation_cancel: Option<CancellationToken>,
     backend_refreshing: bool,
+    speech_refreshing: bool,
     last_backend_attempt: Instant,
+    last_speech_attempt: Instant,
     internal_tx: mpsc::Sender<InternalEvent>,
     internal_rx: mpsc::Receiver<InternalEvent>,
     theme: ThemeOptions,
@@ -139,6 +164,15 @@ impl App {
         persisted.recent_session = Some(session.id.to_string());
         storage.save_state(&persisted).await?;
         let (internal_tx, internal_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+        let speech = Arc::new(
+            MlxAudioClient::new(config.speech.url.clone())
+                .wrap_err("could not create MLX-Audio client")?,
+        );
+        let audio_inventory = AudioInventory::discover().unwrap_or_else(|error| {
+            warn!(%error, "could not enumerate host audio devices");
+            AudioInventory::default()
+        });
+        let voice_mode = config.speech.enabled && persisted.voice_mode;
         let mut input = TextArea::default();
         configure_input(&mut input);
 
@@ -147,6 +181,7 @@ impl App {
             config,
             storage,
             backend,
+            speech,
             persisted,
             session,
             sessions,
@@ -156,6 +191,14 @@ impl App {
             input,
             link: LinkState::Connecting,
             activity: ActivityState::Idle,
+            voice_mode,
+            voice_state: VoiceState::Disarmed,
+            speech_online: false,
+            audio_inventory,
+            capture: None,
+            playback: None,
+            voice_cancel: None,
+            tts_response_finished: false,
             status: initial_status,
             overlay: None,
             overlay_index: 0,
@@ -167,7 +210,11 @@ impl App {
             generation_started: None,
             generation_cancel: None,
             backend_refreshing: false,
+            speech_refreshing: false,
             last_backend_attempt: Instant::now()
+                .checked_sub(OFFLINE_RETRY)
+                .unwrap_or_else(Instant::now),
+            last_speech_attempt: Instant::now()
                 .checked_sub(OFFLINE_RETRY)
                 .unwrap_or_else(Instant::now),
             internal_tx,
@@ -189,6 +236,7 @@ impl App {
         let shutdown = tokio::signal::ctrl_c();
         tokio::pin!(shutdown);
         self.spawn_backend_refresh();
+        self.spawn_speech_probe();
 
         while !self.should_quit {
             if self.dirty {
@@ -221,6 +269,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render(&self, frame: &mut ratatui::Frame<'_>) {
         let detail = self.selected_model.as_ref().and_then(model_detail);
         let session_id = short_id(self.session.id);
@@ -269,6 +318,45 @@ impl App {
                 message_count: session.message_count,
             })
             .collect();
+        let audio_devices = self
+            .audio_inventory
+            .inputs
+            .iter()
+            .chain(self.audio_inventory.outputs.iter())
+            .collect::<Vec<_>>();
+        let audio_details = audio_devices
+            .iter()
+            .map(|device| {
+                format!(
+                    "{}ch · {:.1} kHz",
+                    device.channels,
+                    f64::from(device.sample_rate) / 1000.0
+                )
+            })
+            .collect::<Vec<_>>();
+        let audio_choices = audio_devices
+            .iter()
+            .zip(&audio_details)
+            .map(|(device, detail)| AudioChoice {
+                id: &device.id,
+                name: &device.name,
+                detail,
+                direction: device.direction,
+                is_default: device.is_default,
+                is_selected: match device.direction {
+                    AudioDirection::Input => self
+                        .persisted
+                        .input_device_id
+                        .as_deref()
+                        .map_or(device.is_default, |id| id == device.id),
+                    AudioDirection::Output => self
+                        .persisted
+                        .output_device_id
+                        .as_deref()
+                        .map_or(device.is_default, |id| id == device.id),
+                },
+            })
+            .collect::<Vec<_>>();
         let link_signal_samples: Vec<_> = if self.config.animation {
             self.signal_samples.iter().copied().collect()
         } else {
@@ -292,17 +380,49 @@ impl App {
             }),
             Some(Overlay::Help) => Some(OverlayView::Help { bindings: &help }),
             Some(Overlay::Inspector) => Some(OverlayView::Inspector),
+            Some(Overlay::Audio) => Some(OverlayView::Audio {
+                items: &audio_choices,
+                selected: self.overlay_index,
+            }),
             None => None,
+        };
+
+        let input_device = selected_device_name(
+            &self.audio_inventory.inputs,
+            self.persisted.input_device_id.as_deref(),
+        );
+        let output_device = selected_device_name(
+            &self.audio_inventory.outputs,
+            self.persisted.output_device_id.as_deref(),
+        );
+        let voice = VoiceView {
+            mode: if self.voice_mode {
+                InteractionMode::Voice
+            } else {
+                InteractionMode::Typing
+            },
+            state: self.voice_state,
+            speech_online: self.speech_online,
+            input_device,
+            output_device,
+            asr_model: &self.config.speech.asr_model,
+            tts_model: &self.config.speech.tts_model,
+        };
+        let input_title = if self.voice_mode {
+            "VOICE DECK // SPACE RECORD/STOP  F3 TYPE  F4 AUDIO"
+        } else {
+            "SIGNAL INPUT // ENTER SEND  ALT+ENTER NEWLINE  F3 VOICE"
         };
 
         let view = UiView {
             messages: &self.session.messages,
             input: &self.input,
-            input_title: "SIGNAL INPUT // ENTER SEND  ALT+ENTER NEWLINE",
+            input_title,
             link: self.link,
             activity: self.activity,
             status_message: self.status.as_deref(),
             telemetry,
+            voice,
             link_signal_samples: &link_signal_samples,
             input_signal_samples: &input_signal_samples,
             transcript_scroll: self.transcript_scroll,
@@ -318,7 +438,10 @@ impl App {
         model_detail: Option<&'a str>,
     ) -> TelemetryView<'a> {
         let endpoint = self.backend_info.as_ref().map_or_else(
-            || self.config.ollama_url.as_str(),
+            || match self.config.backend {
+                BackendKind::Ollama => self.config.ollama_url.as_str(),
+                BackendKind::LlamaCpp => self.config.llama_url.as_str(),
+            },
             |info| info.endpoint.as_str(),
         );
         let usage = self.last_usage.as_ref();
@@ -356,7 +479,7 @@ impl App {
     async fn handle_terminal_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) if key.kind == KeyEventKind::Press => self.handle_key(key).await?,
-            Event::Paste(text) if self.overlay.is_none() => {
+            Event::Paste(text) if self.overlay.is_none() && !self.voice_mode => {
                 self.input.insert_str(text);
                 self.pulse_input(12);
                 self.dirty = true;
@@ -397,6 +520,7 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     self.spawn_backend_refresh();
+                    self.spawn_speech_probe();
                     return Ok(());
                 }
                 _ => {}
@@ -406,7 +530,10 @@ impl App {
         match key.code {
             KeyCode::F(1) => self.open_overlay(Overlay::Help),
             KeyCode::F(2) => self.open_overlay(Overlay::Inspector),
-            KeyCode::Esc => self.cancel_generation(),
+            KeyCode::F(3) => self.toggle_voice_mode().await?,
+            KeyCode::F(4) => self.open_audio(),
+            KeyCode::Esc => self.cancel_active_work(),
+            KeyCode::Char(' ') if self.voice_mode => self.handle_voice_trigger().await?,
             KeyCode::PageUp => {
                 self.transcript_scroll.follow_tail = false;
                 self.transcript_scroll.offset_from_tail = self
@@ -443,17 +570,18 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::Enter => self.send_message().await?,
-            _ => {
+            _ if !self.voice_mode => {
                 self.input.input(key);
                 self.pulse_input(8);
                 self.dirty = true;
             }
+            _ => {}
         }
         Ok(())
     }
 
     async fn handle_overlay_key(&mut self, key: KeyEvent) -> Result<()> {
-        if key.code == KeyCode::Esc || key.code == KeyCode::F(1) || key.code == KeyCode::F(2) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::F(1..=4)) {
             self.overlay = None;
             self.dirty = true;
             return Ok(());
@@ -462,6 +590,9 @@ impl App {
         let item_count = match self.overlay {
             Some(Overlay::Models) => self.models.len(),
             Some(Overlay::Sessions) => self.sessions.len(),
+            Some(Overlay::Audio) => {
+                self.audio_inventory.inputs.len() + self.audio_inventory.outputs.len()
+            }
             Some(Overlay::Help | Overlay::Inspector) | None => 0,
         };
         match key.code {
@@ -474,14 +605,19 @@ impl App {
             KeyCode::Enter => match self.overlay {
                 Some(Overlay::Models) => self.select_model(self.overlay_index).await?,
                 Some(Overlay::Sessions) => self.select_session(self.overlay_index).await?,
+                Some(Overlay::Audio) => self.select_audio_device(self.overlay_index).await?,
                 Some(Overlay::Help | Overlay::Inspector) | None => self.overlay = None,
             },
+            KeyCode::Char('r') if self.overlay == Some(Overlay::Audio) => {
+                self.refresh_audio_inventory();
+            }
             _ => {}
         }
         self.dirty = true;
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn handle_internal_event(&mut self, event: InternalEvent) -> Result<()> {
         match event {
             InternalEvent::BackendReady { info, models } => {
@@ -506,7 +642,7 @@ impl App {
                     }
                     StartupModelChoice::NoModels => {
                         self.status = Some(
-                            "NO LOCAL MODELS // install one with `ollama pull <model>`".to_owned(),
+                            "NO LOCAL MODELS // load one in the configured chat backend".to_owned(),
                         );
                     }
                     StartupModelChoice::Picker if self.selected_model.is_none() => {
@@ -519,7 +655,8 @@ impl App {
                 self.backend_refreshing = false;
                 self.link = LinkState::Offline;
                 self.status = Some(format!(
-                    "OLLAMA OFFLINE // {} // Ctrl+R retry",
+                    "{} OFFLINE // {} // Ctrl+R retry",
+                    backend_label(self.config.backend),
                     error.message
                 ));
             }
@@ -557,6 +694,66 @@ impl App {
                 }
             }
             InternalEvent::Chat(event) => self.handle_chat_event(event).await?,
+            InternalEvent::SpeechProbe(result) => {
+                self.speech_refreshing = false;
+                match result {
+                    Ok(_) => {
+                        self.speech_online = true;
+                        if self.voice_mode && self.voice_state == VoiceState::Disarmed {
+                            self.voice_state = VoiceState::Ready;
+                            self.status =
+                                Some("QWEN VOICE LINK READY // Space to record".to_owned());
+                        }
+                    }
+                    Err(error) => {
+                        self.speech_online = false;
+                        if self.voice_mode {
+                            self.voice_state = VoiceState::Disarmed;
+                            self.status =
+                                Some(format!("MLX-AUDIO OFFLINE // {error} // run xikoi setup"));
+                        }
+                    }
+                }
+            }
+            InternalEvent::Transcription(result) => {
+                self.voice_cancel = None;
+                match result {
+                    Ok(text) => {
+                        self.voice_state = VoiceState::Thinking;
+                        self.status = Some(format!("VOICE DECODED // {text}"));
+                        self.send_content(text, MessageOrigin::Speech).await?;
+                    }
+                    Err(error) => {
+                        self.voice_state = VoiceState::Failed;
+                        self.activity = ActivityState::Failed;
+                        self.status = Some(format!("TRANSCRIPTION FAILED // {error}"));
+                    }
+                }
+            }
+            InternalEvent::TtsChunk(bytes) => {
+                if let Some(playback) = self.playback.as_mut() {
+                    playback.enqueue_pcm16(&bytes, QWEN_TTS_SAMPLE_RATE);
+                    self.voice_state = VoiceState::Speaking;
+                    self.activity = ActivityState::Streaming;
+                    self.status = Some("AI VOICE // streaming local Qwen synthesis".to_owned());
+                }
+            }
+            InternalEvent::TtsFinished(result) => match result {
+                Ok(()) => {
+                    self.voice_cancel = None;
+                    self.tts_response_finished = true;
+                }
+                Err(error) => {
+                    self.voice_cancel = None;
+                    if let Some(playback) = self.playback.take() {
+                        playback.stop();
+                    }
+                    self.tts_response_finished = false;
+                    self.voice_state = VoiceState::Failed;
+                    self.activity = ActivityState::Failed;
+                    self.status = Some(format!("SPEECH SYNTHESIS FAILED // {error}"));
+                }
+            },
         }
         self.dirty = true;
         Ok(())
@@ -572,10 +769,16 @@ impl App {
                     message.content.push_str(&delta);
                 }
                 self.activity = ActivityState::Streaming;
+                if self.voice_mode {
+                    self.voice_state = VoiceState::Thinking;
+                }
                 self.pulse_link((delta.chars().count() as u64).clamp(4, 80));
             }
             ChatEvent::ThinkingDelta(delta) => {
                 self.activity = ActivityState::Thinking;
+                if self.voice_mode {
+                    self.voice_state = VoiceState::Thinking;
+                }
                 self.pulse_link((delta.chars().count() as u64).clamp(2, 36));
             }
             ChatEvent::Finished { reason, usage } => {
@@ -590,6 +793,12 @@ impl App {
                     message.finish_reason = reason;
                     message.usage = Some(usage.clone());
                 }
+                let spoken_response = self
+                    .session
+                    .messages
+                    .get(index)
+                    .map(|message| message.content.trim().to_owned())
+                    .filter(|content| !content.is_empty());
                 self.persist_streaming_message(index).await?;
                 self.last_usage = Some(usage);
                 self.finish_generation("LINK COMPLETE");
@@ -597,6 +806,11 @@ impl App {
                     self.status = Some(warning);
                 }
                 self.refresh_selected_model();
+                if self.voice_mode
+                    && let Some(response) = spoken_response
+                {
+                    self.start_synthesis(&response);
+                }
             }
             ChatEvent::Failed(error) => {
                 if let Some(message) = self.session.messages.get_mut(index) {
@@ -606,6 +820,9 @@ impl App {
                 self.persist_streaming_message(index).await?;
                 self.finish_generation("LINK FAILED");
                 self.activity = ActivityState::Failed;
+                if self.voice_mode {
+                    self.voice_state = VoiceState::Failed;
+                }
                 self.status = Some(format!("GENERATION FAILED // {}", error.message));
             }
             ChatEvent::Cancelled => {
@@ -615,13 +832,62 @@ impl App {
                 }
                 self.persist_streaming_message(index).await?;
                 self.finish_generation("LINK CANCELLED");
+                if self.voice_mode && self.capture.is_none() {
+                    self.voice_state = VoiceState::Ready;
+                }
             }
         }
         Ok(())
     }
 
     fn handle_tick(&mut self) {
+        if let Some(capture) = self.capture.as_mut() {
+            capture.drain();
+            let level = capture.level();
+            let problem = capture.has_problem();
+            push_signal(&mut self.input_signal_samples, level.max(1));
+            if problem {
+                self.status = Some(
+                    "MICROPHONE BUFFER PRESSURE // capture remains bounded; stop and retry"
+                        .to_owned(),
+                );
+            }
+            self.dirty = true;
+        }
+        if let Some(playback) = self.playback.as_ref() {
+            let level = playback.level();
+            let problem = playback.has_problem();
+            push_signal(&mut self.signal_samples, level.max(1));
+            if problem {
+                self.status = Some(
+                    "OUTPUT BUFFER PRESSURE // some synthesized audio may have been dropped"
+                        .to_owned(),
+                );
+            }
+            self.dirty = true;
+        }
+        if self.tts_response_finished
+            && self
+                .playback
+                .as_ref()
+                .is_some_and(PlaybackSession::is_empty)
+        {
+            if let Some(playback) = self.playback.take() {
+                playback.stop();
+            }
+            self.tts_response_finished = false;
+            self.voice_state = VoiceState::Ready;
+            self.activity = ActivityState::Idle;
+            self.status = Some("VOICE LINK COMPLETE // Space to speak".to_owned());
+            self.dirty = true;
+        }
         if self.config.animation {
+            if self.activity == ActivityState::Thinking
+                && let Some(started) = self.generation_started
+            {
+                let phase = u64::try_from(started.elapsed().as_millis() / 80).unwrap_or(u64::MAX);
+                push_signal(&mut self.signal_samples, 12 + (phase.wrapping_mul(17) % 52));
+            }
             let link_active = decay_signal(&mut self.signal_samples);
             let input_active = decay_signal(&mut self.input_signal_samples);
             if link_active || input_active || self.generation_started.is_some() {
@@ -634,36 +900,53 @@ impl App {
         {
             self.spawn_backend_refresh();
         }
+        if self.config.speech.enabled
+            && self.voice_mode
+            && !self.speech_online
+            && !self.speech_refreshing
+            && self.last_speech_attempt.elapsed() >= OFFLINE_RETRY
+        {
+            self.spawn_speech_probe();
+        }
     }
 
     async fn send_message(&mut self) -> Result<()> {
+        let content = self.input.lines().join("\n");
+        self.send_content(content.trim_end().to_owned(), MessageOrigin::Typed)
+            .await
+    }
+
+    async fn send_content(&mut self, content: String, origin: MessageOrigin) -> Result<()> {
         if self.generation_cancel.is_some() {
             self.status = Some("GENERATION ACTIVE // Esc cancels the current link".to_owned());
             self.dirty = true;
             return Ok(());
         }
-        let Some(model) = self.selected_model.as_ref() else {
+        let Some(model_name) = self
+            .selected_model
+            .as_ref()
+            .map(|model| model.summary.name.clone())
+        else {
             self.open_models();
             self.status = Some("SELECT A LOCAL MODEL BEFORE TRANSMITTING".to_owned());
             return Ok(());
         };
-        let content = self.input.lines().join("\n");
-        let content = content.trim_end();
         if content.trim().is_empty() {
             return Ok(());
         }
 
-        let user = ChatMessage::user(content.to_owned());
+        let mut user = ChatMessage::user(content);
+        user.origin = origin;
         self.storage.append_message(self.session.id, &user).await?;
         self.session.messages.push(user);
         let request = ChatRequest {
-            model: model.summary.name.clone(),
+            model: model_name.clone(),
             messages: self.session.messages.clone(),
             options: GenerationOptions {
                 keep_alive: self.config.keep_alive.clone(),
             },
         };
-        let assistant = ChatMessage::streaming_assistant(model.summary.name.clone());
+        let assistant = ChatMessage::streaming_assistant(model_name);
         self.session.messages.push(assistant);
         self.streaming_message = Some(self.session.messages.len() - 1);
         self.input = TextArea::default();
@@ -671,7 +954,12 @@ impl App {
         self.last_usage = None;
         self.generation_started = Some(Instant::now());
         self.activity = ActivityState::Thinking;
-        self.status = Some("ESTABLISHING MODEL LINK".to_owned());
+        if origin == MessageOrigin::Speech {
+            self.voice_state = VoiceState::Thinking;
+            self.status = Some("AI THINKING // local model link active".to_owned());
+        } else {
+            self.status = Some("ESTABLISHING MODEL LINK".to_owned());
+        }
         self.transcript_scroll = TranscriptScroll::following_tail();
 
         let cancellation = CancellationToken::new();
@@ -705,7 +993,32 @@ impl App {
         }
     }
 
+    fn cancel_active_work(&mut self) {
+        self.cancel_voice();
+        self.cancel_generation();
+    }
+
+    fn cancel_voice(&mut self) {
+        if let Some(cancellation) = self.voice_cancel.take() {
+            cancellation.cancel();
+        }
+        if let Some(capture) = self.capture.take() {
+            drop(capture.finish());
+        }
+        if let Some(playback) = self.playback.take() {
+            playback.stop();
+        }
+        self.tts_response_finished = false;
+        self.voice_state = if self.voice_mode && self.speech_online {
+            VoiceState::Ready
+        } else {
+            VoiceState::Disarmed
+        };
+        self.dirty = true;
+    }
+
     async fn request_quit(&mut self) -> Result<()> {
+        self.cancel_voice();
         if let Some(cancellation) = self.generation_cancel.take() {
             cancellation.cancel();
         }
@@ -748,7 +1061,10 @@ impl App {
         self.backend_refreshing = true;
         self.last_backend_attempt = Instant::now();
         self.link = LinkState::Connecting;
-        self.status = Some("PROBING OLLAMA LINK".to_owned());
+        self.status = Some(format!(
+            "PROBING {} LINK",
+            backend_label(self.config.backend)
+        ));
         self.dirty = true;
 
         let backend = Arc::clone(&self.backend);
@@ -768,6 +1084,290 @@ impl App {
                 }
             }
         });
+    }
+
+    fn spawn_speech_probe(&mut self) {
+        if !self.config.speech.enabled || self.speech_refreshing {
+            return;
+        }
+        self.speech_refreshing = true;
+        self.last_speech_attempt = Instant::now();
+        if self.voice_mode {
+            self.status = Some("PROBING LOCAL MLX-AUDIO LINK".to_owned());
+        }
+        let speech = Arc::clone(&self.speech);
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let result = speech.probe().await.map_err(|error| error.to_string());
+            let _ = tx.send(InternalEvent::SpeechProbe(result)).await;
+        });
+    }
+
+    async fn toggle_voice_mode(&mut self) -> Result<()> {
+        if self.voice_mode {
+            self.voice_mode = false;
+            self.cancel_voice();
+            self.voice_state = VoiceState::Disarmed;
+            self.status = Some("TYPE INTERFACE ACTIVE // F3 restores voice deck".to_owned());
+        } else if !self.config.speech.enabled {
+            self.status =
+                Some("VOICE LAYER DISABLED // remove --no-speech or enable config".to_owned());
+            return Ok(());
+        } else {
+            self.voice_mode = true;
+            self.voice_state = if self.speech_online {
+                VoiceState::Ready
+            } else {
+                VoiceState::Disarmed
+            };
+            if self.speech_online {
+                self.status = Some("VOICE INTERFACE ACTIVE // Space to record".to_owned());
+            } else {
+                self.status = Some("VOICE INTERFACE WAITING // run xikoi setup".to_owned());
+                self.spawn_speech_probe();
+            }
+        }
+        self.persisted.voice_mode = self.voice_mode;
+        self.storage.save_state(&self.persisted).await?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    async fn handle_voice_trigger(&mut self) -> Result<()> {
+        match self.voice_state {
+            VoiceState::Listening => {
+                self.stop_recording();
+                Ok(())
+            }
+            VoiceState::Ready | VoiceState::Failed => self.start_recording().await,
+            VoiceState::Speaking | VoiceState::Synthesizing => {
+                self.cancel_voice();
+                self.start_recording().await
+            }
+            VoiceState::Thinking => {
+                self.cancel_generation();
+                self.start_recording().await
+            }
+            VoiceState::Transcribing => {
+                self.status = Some("TRANSCRIPTION ACTIVE // Esc cancels".to_owned());
+                self.dirty = true;
+                Ok(())
+            }
+            VoiceState::Disarmed => {
+                self.status = Some("MLX-AUDIO OFFLINE // run xikoi setup, then Ctrl+R".to_owned());
+                self.spawn_speech_probe();
+                self.dirty = true;
+                Ok(())
+            }
+        }
+    }
+
+    async fn start_recording(&mut self) -> Result<()> {
+        if !self.speech_online {
+            self.voice_state = VoiceState::Disarmed;
+            self.status = Some("MLX-AUDIO OFFLINE // voice capture is disarmed".to_owned());
+            self.spawn_speech_probe();
+            return Ok(());
+        }
+        if self.selected_model.is_none() {
+            self.open_models();
+            self.status = Some("SELECT A LOCAL CHAT MODEL BEFORE RECORDING".to_owned());
+            return Ok(());
+        }
+        self.cancel_voice();
+        match CaptureSession::start(self.persisted.input_device_id.as_deref()) {
+            Ok(capture) => {
+                self.persisted.input_device_id = Some(capture.device_id.clone());
+                self.storage.save_state(&self.persisted).await?;
+                self.status = Some(format!(
+                    "MIC LIVE // {} // Space stops and transcribes",
+                    capture.device_name
+                ));
+                self.capture = Some(capture);
+                self.voice_state = VoiceState::Listening;
+                self.activity = ActivityState::Idle;
+            }
+            Err(error) => {
+                self.voice_state = VoiceState::Failed;
+                self.activity = ActivityState::Failed;
+                self.status = Some(format!("MICROPHONE UNAVAILABLE // {error}"));
+            }
+        }
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(capture) = self.capture.take() else {
+            return;
+        };
+        let audio = capture.finish();
+        if audio.duration_seconds() < 0.25 {
+            self.voice_state = VoiceState::Ready;
+            self.status =
+                Some("VOICE CAPTURE TOO SHORT // hold Space between start and stop".to_owned());
+            return;
+        }
+        let wav = match audio.to_asr_wav() {
+            Ok(wav) => wav,
+            Err(error) => {
+                self.voice_state = VoiceState::Failed;
+                self.activity = ActivityState::Failed;
+                self.status = Some(format!("AUDIO ENCODE FAILED // {error}"));
+                return;
+            }
+        };
+        let request = TranscriptionRequest {
+            model: self.config.speech.asr_model.clone(),
+            wav,
+            language: None,
+        };
+        let cancellation = CancellationToken::new();
+        self.voice_cancel = Some(cancellation.clone());
+        self.voice_state = VoiceState::Transcribing;
+        self.status = Some(format!(
+            "QWEN ASR // decoding {:.1}s locally",
+            audio.duration_seconds()
+        ));
+        let speech = Arc::clone(&self.speech);
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let result = speech.transcribe(request, &cancellation).await;
+            if matches!(result, Err(SpeechFailure::Cancelled)) {
+                return;
+            }
+            let result = result.map_err(|error| error.to_string());
+            let _ = tx.send(InternalEvent::Transcription(result)).await;
+        });
+        self.dirty = true;
+    }
+
+    fn start_synthesis(&mut self, content: &str) {
+        let spoken = text_for_speech(content);
+        if spoken.is_empty() {
+            self.voice_state = VoiceState::Ready;
+            return;
+        }
+        let playback = match PlaybackSession::start(self.persisted.output_device_id.as_deref()) {
+            Ok(playback) => playback,
+            Err(error) => {
+                self.voice_state = VoiceState::Failed;
+                self.activity = ActivityState::Failed;
+                self.status = Some(format!("AUDIO OUTPUT UNAVAILABLE // {error}"));
+                return;
+            }
+        };
+        self.status = Some(format!(
+            "QWEN TTS // {} // {}",
+            self.config.speech.tts_voice, playback.device_name
+        ));
+        self.playback = Some(playback);
+        self.tts_response_finished = false;
+        self.voice_state = VoiceState::Synthesizing;
+        self.activity = ActivityState::Thinking;
+
+        let request = SynthesisRequest::qwen(
+            self.config.speech.tts_model.clone(),
+            spoken,
+            self.config.speech.tts_voice.clone(),
+        );
+        let cancellation = CancellationToken::new();
+        self.voice_cancel = Some(cancellation.clone());
+        let speech = Arc::clone(&self.speech);
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let response = match speech.synthesize(&request, &cancellation).await {
+                Ok(response) => response,
+                Err(SpeechFailure::Cancelled) => return,
+                Err(error) => {
+                    let _ = tx
+                        .send(InternalEvent::TtsFinished(Err(error.to_string())))
+                        .await;
+                    return;
+                }
+            };
+            let mut stream = response.bytes_stream();
+            loop {
+                let item = tokio::select! {
+                    () = cancellation.cancelled() => return,
+                    item = stream.next() => item,
+                };
+                match item {
+                    Some(Ok(bytes)) => {
+                        if tx
+                            .send(InternalEvent::TtsChunk(bytes.to_vec()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Some(Err(error)) => {
+                        let _ = tx
+                            .send(InternalEvent::TtsFinished(Err(error.to_string())))
+                            .await;
+                        return;
+                    }
+                    None => {
+                        let _ = tx.send(InternalEvent::TtsFinished(Ok(()))).await;
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    fn refresh_audio_inventory(&mut self) {
+        match AudioInventory::discover() {
+            Ok(inventory) => {
+                self.audio_inventory = inventory;
+                self.overlay_index = self.overlay_index.min(
+                    self.audio_inventory
+                        .inputs
+                        .len()
+                        .saturating_add(self.audio_inventory.outputs.len())
+                        .saturating_sub(1),
+                );
+                self.status = Some("AUDIO MATRIX REFRESHED".to_owned());
+            }
+            Err(error) => {
+                self.status = Some(format!("AUDIO ENUMERATION FAILED // {error}"));
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn open_audio(&mut self) {
+        self.refresh_audio_inventory();
+        self.open_overlay(Overlay::Audio);
+    }
+
+    async fn select_audio_device(&mut self, index: usize) -> Result<()> {
+        let device = self
+            .audio_inventory
+            .inputs
+            .iter()
+            .chain(self.audio_inventory.outputs.iter())
+            .nth(index)
+            .cloned();
+        let Some(device) = device else {
+            return Ok(());
+        };
+        match device.direction {
+            AudioDirection::Input => self.persisted.input_device_id = Some(device.id.clone()),
+            AudioDirection::Output => self.persisted.output_device_id = Some(device.id.clone()),
+        }
+        self.storage.save_state(&self.persisted).await?;
+        self.status = Some(format!(
+            "{} ROUTED // {}",
+            match device.direction {
+                AudioDirection::Input => "MIC",
+                AudioDirection::Output => "OUTPUT",
+            },
+            device.name
+        ));
+        self.overlay = None;
+        Ok(())
     }
 
     fn refresh_selected_model(&self) {
@@ -893,6 +1493,42 @@ fn configure_input(input: &mut TextArea<'static>) {
     input.set_placeholder_text("Transmit a message to the selected local model…");
 }
 
+const fn backend_label(backend: BackendKind) -> &'static str {
+    match backend {
+        BackendKind::Ollama => "OLLAMA",
+        BackendKind::LlamaCpp => "LLAMA.CPP",
+    }
+}
+
+fn selected_device_name<'a>(devices: &'a [AudioDevice], selected_id: Option<&str>) -> &'a str {
+    selected_id
+        .and_then(|id| devices.iter().find(|device| device.id == id))
+        .or_else(|| devices.iter().find(|device| device.is_default))
+        .or_else(|| devices.first())
+        .map_or("SYSTEM DEFAULT", |device| device.name.as_str())
+}
+
+fn text_for_speech(content: &str) -> String {
+    let mut spoken = String::with_capacity(content.len());
+    let mut previous_space = false;
+    for character in content.chars() {
+        let character = match character {
+            '#' | '*' | '_' | '`' | '[' | ']' => ' ',
+            other => other,
+        };
+        if character.is_whitespace() {
+            if !previous_space {
+                spoken.push(' ');
+                previous_space = true;
+            }
+        } else {
+            spoken.push(character);
+            previous_space = false;
+        }
+    }
+    spoken.trim().to_owned()
+}
+
 fn choose_startup_model(
     models: &[ModelSummary],
     requested: Option<&str>,
@@ -1000,7 +1636,19 @@ fn help_bindings() -> Vec<HelpBinding<'static>> {
         },
         HelpBinding {
             keys: "Esc",
-            action: "cancel generation or close overlay",
+            action: "cancel voice, playback, generation, or overlay",
+        },
+        HelpBinding {
+            keys: "F3",
+            action: "toggle typing and neural voice modes",
+        },
+        HelpBinding {
+            keys: "F4",
+            action: "select microphone and output route",
+        },
+        HelpBinding {
+            keys: "Space (voice)",
+            action: "start/stop capture or manually barge in",
         },
         HelpBinding {
             keys: "PgUp / PgDn / End",
@@ -1020,7 +1668,7 @@ fn help_bindings() -> Vec<HelpBinding<'static>> {
         },
         HelpBinding {
             keys: "Ctrl+R",
-            action: "retry Ollama connection",
+            action: "retry Ollama and MLX-Audio links",
         },
         HelpBinding {
             keys: "F2",
@@ -1089,13 +1737,22 @@ mod tests {
         let storage = Storage::new(paths.clone());
         storage.initialize().await.unwrap();
         let config = RuntimeConfig {
+            backend: crate::config::BackendKind::Ollama,
             ollama_url: "http://127.0.0.1:11434".parse().unwrap(),
+            llama_url: "http://127.0.0.1:8080".parse().unwrap(),
             requested_model: None,
             resume: None,
             keep_alive: None,
             color: ColorMode::Mono,
             animation: false,
             allow_cloud_models: false,
+            speech: crate::config::SpeechConfig {
+                enabled: false,
+                url: "http://127.0.0.1:8000".parse().unwrap(),
+                asr_model: "qwen-asr".to_owned(),
+                tts_model: "qwen-tts".to_owned(),
+                tts_voice: "Vivian".to_owned(),
+            },
             paths,
         };
         let app = App::bootstrap(config, storage, Arc::new(MockBackend))
@@ -1214,6 +1871,32 @@ mod tests {
         input.insert_str("naïve");
 
         assert_eq!(input.lines(), ["λ界🧠", "naïve"]);
+    }
+
+    #[test]
+    fn speech_cleanup_removes_markdown_control_noise() {
+        assert_eq!(
+            text_for_speech("# **Hello**\n`local code`"),
+            "Hello local code"
+        );
+    }
+
+    #[tokio::test]
+    async fn transcribed_turns_keep_voice_provenance() {
+        let (_temporary, mut app) = test_app().await;
+        app.selected_model = Some(SelectedModel {
+            summary: ModelSummary {
+                name: "qwen".to_owned(),
+                ..ModelSummary::default()
+            },
+            ..SelectedModel::default()
+        });
+        app.send_content("spoken locally".to_owned(), MessageOrigin::Speech)
+            .await
+            .unwrap();
+
+        assert_eq!(app.session.messages[0].origin, MessageOrigin::Speech);
+        assert_eq!(app.session.messages[0].content, "spoken locally");
     }
 
     #[tokio::test]

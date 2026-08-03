@@ -12,9 +12,11 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 use uuid::Uuid;
 use xikoi::{
     app::App,
-    backend::ollama::OllamaBackend,
-    config::{AppPaths, Cli, RuntimeConfig},
+    backend::{ChatBackend, llama_cpp::LlamaCppBackend, ollama::OllamaBackend},
+    config::{AppPaths, BackendKind, Cli, CliCommand, RuntimeConfig},
+    setup,
     storage::Storage,
+    voice_runtime::VoiceRuntime,
 };
 
 const LOG_FILE_RETENTION: usize = 10;
@@ -23,15 +25,45 @@ const LOG_FILE_RETENTION: usize = 10;
 async fn main() -> Result<()> {
     color_eyre::install()?;
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
     let paths = AppPaths::discover()?;
+    let command = cli.command.take();
+    let config = RuntimeConfig::load(cli, paths.clone()).await?;
+
+    match command {
+        Some(CliCommand::Setup(arguments)) => return setup::run(&config, &arguments).await,
+        Some(CliCommand::Doctor) => return setup::doctor(&config).await,
+        Some(CliCommand::VoiceServer) => return setup::voice_server(&config),
+        None => {}
+    }
+
     let storage = Storage::new(paths.clone());
     storage.initialize().await?;
     let _log_guard = initialize_logging(&paths)?;
-    let config = RuntimeConfig::load(cli, paths).await?;
-    let backend = Arc::new(
-        OllamaBackend::new(config.ollama_url.clone()).wrap_err("could not create Ollama client")?,
-    );
+    let _voice_server = if config.speech.enabled {
+        match VoiceRuntime::from_paths(&config.paths)
+            .spawn_managed(&config.speech, &config.paths.logs)
+            .await
+        {
+            Ok(server) => server,
+            Err(error) => {
+                tracing::warn!(%error, "managed voice server could not start");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let backend: Arc<dyn ChatBackend> = match config.backend {
+        BackendKind::Ollama => Arc::new(
+            OllamaBackend::new(config.ollama_url.clone())
+                .wrap_err("could not create Ollama client")?,
+        ),
+        BackendKind::LlamaCpp => Arc::new(
+            LlamaCppBackend::new(config.llama_url.clone())
+                .wrap_err("could not create llama.cpp client")?,
+        ),
+    };
     let mut app = App::bootstrap(config, storage, backend).await?;
 
     let mut terminal = ratatui::init();
