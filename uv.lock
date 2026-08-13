@@ -847,7 +847,7 @@ wheels = [
 
 [[package]]
 name = "xikoi-voice-runtime"
-version = "0.1.0"
+version = "0.1.1"
 source = { virtual = "." }
 dependencies = [
     { name = "mlx-audio", extra = ["server", "stt", "tts"], marker = "platform_machine == 'arm64' and sys_platform == 'darwin'" },

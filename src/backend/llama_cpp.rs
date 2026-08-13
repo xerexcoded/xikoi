@@ -10,9 +10,15 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{ChatBackend, ChatEventReceiver};
-use crate::domain::{
-    BackendErrorKind, BackendFailure, BackendInfo, ChatEvent, ChatRequest, ModelSummary,
-    SelectedModel, Usage,
+use crate::{
+    domain::{
+        BackendErrorKind, BackendFailure, BackendInfo, ChatEvent, ChatRequest, ModelSummary,
+        SelectedModel, Usage,
+    },
+    http_limits::{
+        CONNECT_TIMEOUT, LimitedBodyError, MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES,
+        REQUEST_TIMEOUT, read_limited_body,
+    },
 };
 
 const CHAT_EVENT_CHANNEL_CAPACITY: usize = 256;
@@ -22,18 +28,20 @@ const MAX_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 pub struct LlamaCppBackend {
     base_url: Url,
     client: Client,
+    request_timeout: Duration,
 }
 
 impl LlamaCppBackend {
     pub fn new(base_url: Url) -> Result<Self, BackendFailure> {
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(3))
+            .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(concat!("xikoi/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| unavailable(format!("could not create llama.cpp client: {error}")))?;
         Ok(Self {
             base_url: normalize_base_url(base_url),
             client,
+            request_timeout: REQUEST_TIMEOUT,
         })
     }
 
@@ -47,6 +55,7 @@ impl LlamaCppBackend {
         let response = self
             .client
             .get(self.endpoint(path)?)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(|error| self.transport_failure(&error))?;
@@ -58,15 +67,28 @@ impl LlamaCppBackend {
         response: Response,
     ) -> Result<T, BackendFailure> {
         let status = response.status();
-        let body = response
-            .bytes()
+        let limit = if status.is_success() {
+            MAX_JSON_BODY_BYTES
+        } else {
+            MAX_ERROR_BODY_BYTES
+        };
+        let body = read_limited_body(response, limit)
             .await
-            .map_err(|error| self.transport_failure(&error))?;
+            .map_err(|error| self.limited_body_failure(error))?;
         if !status.is_success() {
             return Err(status_failure(status, &body));
         }
         serde_json::from_slice(&body)
             .map_err(|error| protocol(format!("llama.cpp returned invalid JSON: {error}")))
+    }
+
+    fn limited_body_failure(&self, error: LimitedBodyError) -> BackendFailure {
+        match error {
+            LimitedBodyError::TooLarge { limit } => protocol(format!(
+                "llama.cpp returned a response larger than {limit} bytes"
+            )),
+            LimitedBodyError::Transport(error) => self.transport_failure(&error),
+        }
     }
 
     fn transport_failure(&self, error: &reqwest::Error) -> BackendFailure {
@@ -142,6 +164,7 @@ impl ChatBackend for LlamaCppBackend {
     ) -> Result<ChatEventReceiver, BackendFailure> {
         let (events, receiver) = mpsc::channel(CHAT_EVENT_CHANNEL_CAPACITY);
         let payload = ChatPayload::from(&request);
+        let started = Instant::now();
         let dispatch = self
             .client
             .post(self.endpoint("v1/chat/completions")?)
@@ -156,13 +179,12 @@ impl ChatBackend for LlamaCppBackend {
         };
         if !response.status().is_success() {
             let status = response.status();
-            let body = response
-                .bytes()
+            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
                 .await
-                .map_err(|error| self.transport_failure(&error))?;
+                .map_err(|error| self.limited_body_failure(error))?;
             return Err(status_failure(status, &body));
         }
-        tokio::spawn(consume_sse(response, events, cancellation, Instant::now()));
+        tokio::spawn(consume_sse(response, events, cancellation, started));
         Ok(receiver)
     }
 }
@@ -226,20 +248,32 @@ async fn consume_sse(
                 return;
             }
             None => {
-                if let Some(line) = framer.finish()
-                    && consume_sse_line(
-                        &line,
-                        &events,
-                        &cancellation,
-                        started,
-                        &mut usage,
-                        &mut finish_reason,
-                        &mut emitted_content,
-                    )
-                    .await
-                    .is_ok_and(|result| result == LineResult::Done)
-                {
-                    return;
+                match framer.finish() {
+                    Ok(Some(line)) => {
+                        match consume_sse_line(
+                            &line,
+                            &events,
+                            &cancellation,
+                            started,
+                            &mut usage,
+                            &mut finish_reason,
+                            &mut emitted_content,
+                        )
+                        .await
+                        {
+                            Ok(LineResult::Done) => return,
+                            Ok(LineResult::Continue) => {}
+                            Err(error) => {
+                                let _ = events.send(ChatEvent::Failed(error)).await;
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = events.send(ChatEvent::Failed(error)).await;
+                        return;
+                    }
                 }
                 let _ = events
                     .send(ChatEvent::Failed(protocol(
@@ -331,21 +365,35 @@ struct SseFramer {
 
 impl SseFramer {
     fn push(&mut self, chunk: &[u8]) -> Result<Vec<Vec<u8>>, BackendFailure> {
-        self.buffer.extend_from_slice(chunk);
-        if self.buffer.len() > MAX_SSE_LINE_BYTES && !self.buffer.contains(&b'\n') {
-            return Err(protocol("llama.cpp SSE line exceeded 16 MiB".to_owned()));
-        }
+        let mut offset = 0;
         let mut lines = Vec::new();
-        while let Some(index) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.buffer.split_to(index + 1);
-            line.truncate(index);
-            lines.push(line.to_vec());
+        while let Some(relative) = chunk[offset..].iter().position(|byte| *byte == b'\n') {
+            let end = offset + relative;
+            let line_len = self.buffer.len().saturating_add(end.saturating_sub(offset));
+            if line_len > MAX_SSE_LINE_BYTES {
+                return Err(protocol("llama.cpp SSE line exceeded 16 MiB".to_owned()));
+            }
+            self.buffer.extend_from_slice(&chunk[offset..end]);
+            lines.push(self.buffer.split().to_vec());
+            offset = end + 1;
+        }
+        if offset < chunk.len() {
+            self.buffer.extend_from_slice(&chunk[offset..]);
+            if self.buffer.len() > MAX_SSE_LINE_BYTES {
+                return Err(protocol("llama.cpp SSE line exceeded 16 MiB".to_owned()));
+            }
         }
         Ok(lines)
     }
 
-    fn finish(&mut self) -> Option<Vec<u8>> {
-        (!self.buffer.is_empty()).then(|| self.buffer.split().to_vec())
+    fn finish(&mut self) -> Result<Option<Vec<u8>>, BackendFailure> {
+        if self.buffer.is_empty() {
+            return Ok(None);
+        }
+        if self.buffer.len() > MAX_SSE_LINE_BYTES {
+            return Err(protocol("llama.cpp SSE line exceeded 16 MiB".to_owned()));
+        }
+        Ok(Some(self.buffer.split().to_vec()))
     }
 }
 
@@ -529,5 +577,69 @@ mod tests {
         };
         assert_eq!(usage.prompt_eval_count, Some(4));
         assert_eq!(usage.eval_count, Some(1));
+    }
+
+    #[test]
+    fn sse_framer_rejects_a_newline_terminated_record_over_the_limit() {
+        let mut record = vec![b'x'; MAX_SSE_LINE_BYTES + 1];
+        record.push(b'\n');
+        let error = SseFramer::default()
+            .push(&record)
+            .expect_err("a 16 MiB-plus data record with a trailing newline must be rejected");
+        assert_eq!(error.kind, BackendErrorKind::Protocol);
+        assert!(error.message.contains("16 MiB"));
+    }
+
+    #[test]
+    fn sse_framer_rejects_an_unterminated_final_record_over_the_limit() {
+        let mut framer = SseFramer {
+            buffer: BytesMut::from(vec![b'x'; MAX_SSE_LINE_BYTES + 1].as_slice()),
+        };
+        let error = framer
+            .finish()
+            .expect_err("the final unterminated record must honor the same size limit");
+        assert_eq!(error.kind, BackendErrorKind::Protocol);
+    }
+
+    #[tokio::test]
+    async fn probe_times_out_when_the_body_stalls() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "status": "ok" }))
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut backend = LlamaCppBackend::new(Url::parse(&server.uri()).unwrap()).unwrap();
+        backend.request_timeout = Duration::from_millis(150);
+        let started = Instant::now();
+        let error = backend.probe().await.expect_err("stalled health must fail");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(error.kind, BackendErrorKind::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn error_bodies_are_capped_before_buffering() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/health"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_raw(vec![b'x'; MAX_ERROR_BODY_BYTES + 8], "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let backend = LlamaCppBackend::new(Url::parse(&server.uri()).unwrap()).unwrap();
+        let error = backend
+            .probe()
+            .await
+            .expect_err("oversized error must fail");
+        assert_eq!(error.kind, BackendErrorKind::Protocol);
+        assert!(error.message.contains("bytes"));
     }
 }

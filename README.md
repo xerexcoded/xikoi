@@ -14,8 +14,9 @@ compact command surface, and live model telemetry stays visible beside it.
 Phosphor green carries the signal over near-black panels, pale text remains
 readable, and amber or crimson is reserved for warning and failure states.
 Motion is restrained to meaningful activity and can be disabled. The same deck
-can run as a keyboard composer or a voice console whose signals are driven by
-real microphone and synthesized-speaker PCM.
+can run as a keyboard composer or a voice console whose AI trace occupies the
+top visualizer and whose user trace lives in the voice deck, both drawn as
+live oscilloscopes from real microphone and synthesized-speaker PCM.
 
 ## Status
 
@@ -27,6 +28,7 @@ Xikoi is an early-stage application. The current contract is:
 - push-to-talk Qwen3-ASR and streaming Qwen3-TTS through MLX-Audio;
 - selection of every input and output device exposed by the host audio system;
 - distinct user-speaking, transcribing, thinking, synthesizing, and AI-speaking states;
+- dual oscilloscopes for live user capture in the voice deck and AI playback in the top visualizer;
 - local JSONL session history and file-based diagnostics;
 - responsive wide, compact, minimal, and safe too-small terminal states;
 - an explicit guided setup for runtimes and model downloads;

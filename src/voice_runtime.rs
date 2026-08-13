@@ -248,6 +248,7 @@ impl Drop for ManagedVoiceServer {
 
 #[derive(Clone, Debug)]
 struct LocalEndpoint {
+    host: String,
     port: u16,
 }
 
@@ -255,16 +256,19 @@ fn local_endpoint(url: &Url) -> Result<LocalEndpoint, VoiceRuntimeError> {
     if url.scheme() != "http" {
         return Err(VoiceRuntimeError::NonLocalSpeechUrl(url.clone()));
     }
-    let local = match url.host() {
-        Some(Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
-        Some(Host::Ipv4(address)) => IpAddr::V4(address).is_loopback(),
-        Some(Host::Ipv6(address)) => IpAddr::V6(address).is_loopback(),
-        None => false,
+    let host = match url.host() {
+        Some(Host::Domain(host)) if host.eq_ignore_ascii_case("localhost") => {
+            "localhost".to_owned()
+        }
+        Some(Host::Ipv4(address)) if IpAddr::V4(address).is_loopback() => address.to_string(),
+        Some(Host::Ipv6(address)) if IpAddr::V6(address).is_loopback() => address.to_string(),
+        _ => return Err(VoiceRuntimeError::NonLocalSpeechUrl(url.clone())),
     };
-    if !local || !matches!(url.path(), "" | "/") || url.query().is_some() {
+    if !matches!(url.path(), "" | "/") || url.query().is_some() {
         return Err(VoiceRuntimeError::NonLocalSpeechUrl(url.clone()));
     }
     Ok(LocalEndpoint {
+        host,
         port: url.port_or_known_default().unwrap_or(8000),
     })
 }
@@ -273,7 +277,7 @@ fn server_command(runtime: &VoiceRuntime, endpoint: &LocalEndpoint) -> Command {
     let mut command = Command::new(runtime.server());
     command
         .arg("--host")
-        .arg("127.0.0.1")
+        .arg(&endpoint.host)
         .arg("--port")
         .arg(endpoint.port.to_string())
         .current_dir(runtime.root())
@@ -391,5 +395,18 @@ mod tests {
         assert!(local_endpoint(&Url::parse("https://127.0.0.1:8000").unwrap()).is_err());
         assert!(local_endpoint(&Url::parse("http://example.com:8000").unwrap()).is_err());
         assert!(local_endpoint(&Url::parse("http://127.0.0.1:8000/api").unwrap()).is_err());
+    }
+
+    #[test]
+    fn managed_server_binds_the_configured_loopback_address() {
+        let ipv6 = local_endpoint(&Url::parse("http://[::1]:8123").unwrap()).unwrap();
+        assert_eq!(ipv6.host, "::1");
+        assert_eq!(ipv6.port, 8123);
+
+        let ipv4 = local_endpoint(&Url::parse("http://127.0.0.1:8000").unwrap()).unwrap();
+        assert_eq!(ipv4.host, "127.0.0.1");
+
+        let localhost = local_endpoint(&Url::parse("http://localhost:8000").unwrap()).unwrap();
+        assert_eq!(localhost.host, "localhost");
     }
 }

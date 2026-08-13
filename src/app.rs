@@ -71,9 +71,18 @@ enum InternalEvent {
     ModelHydrated(Box<ModelHydration>),
     Chat(ChatEvent),
     SpeechProbe(Result<SpeechServerInfo, String>),
-    Transcription(Result<String, String>),
-    TtsChunk(Vec<u8>),
-    TtsFinished(Result<(), String>),
+    Transcription {
+        operation_id: u64,
+        result: Result<String, String>,
+    },
+    TtsChunk {
+        operation_id: u64,
+        bytes: Vec<u8>,
+    },
+    TtsFinished {
+        operation_id: u64,
+        result: Result<(), String>,
+    },
 }
 
 struct ModelHydration {
@@ -105,6 +114,7 @@ pub struct App {
     capture: Option<CaptureSession>,
     playback: Option<PlaybackSession>,
     voice_cancel: Option<CancellationToken>,
+    voice_operation_id: u64,
     tts_response_finished: bool,
     status: Option<String>,
     overlay: Option<Overlay>,
@@ -112,6 +122,8 @@ pub struct App {
     transcript_scroll: TranscriptScroll,
     signal_samples: VecDeque<u64>,
     input_signal_samples: VecDeque<u64>,
+    user_scope_samples: Vec<f32>,
+    ai_scope_samples: Vec<f32>,
     last_usage: Option<Usage>,
     streaming_message: Option<usize>,
     generation_started: Option<Instant>,
@@ -198,6 +210,7 @@ impl App {
             capture: None,
             playback: None,
             voice_cancel: None,
+            voice_operation_id: 0,
             tts_response_finished: false,
             status: initial_status,
             overlay: None,
@@ -205,6 +218,8 @@ impl App {
             transcript_scroll: TranscriptScroll::following_tail(),
             signal_samples: VecDeque::from(vec![0; SIGNAL_CAPACITY]),
             input_signal_samples: VecDeque::from(vec![0; SIGNAL_CAPACITY]),
+            user_scope_samples: Vec::new(),
+            ai_scope_samples: Vec::new(),
             last_usage: None,
             streaming_message: None,
             generation_started: None,
@@ -226,7 +241,7 @@ impl App {
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         let mut terminal_events = EventStream::new();
-        let tick_rate = if self.config.animation {
+        let tick_rate = if self.config.animation || self.config.speech.enabled {
             Duration::from_micros(66_667)
         } else {
             Duration::from_secs(1)
@@ -367,6 +382,12 @@ impl App {
         } else {
             Vec::new()
         };
+        let live_user_scope = self.capture.as_ref().map(CaptureSession::waveform);
+        let live_ai_scope = self.playback.as_ref().map(PlaybackSession::waveform);
+        let user_scope_samples = live_user_scope
+            .as_deref()
+            .unwrap_or(&self.user_scope_samples);
+        let ai_scope_samples = live_ai_scope.as_deref().unwrap_or(&self.ai_scope_samples);
         let help = help_bindings();
         let overlay = match self.overlay {
             Some(Overlay::Models) => Some(OverlayView::Models {
@@ -425,6 +446,8 @@ impl App {
             voice,
             link_signal_samples: &link_signal_samples,
             input_signal_samples: &input_signal_samples,
+            user_scope_samples,
+            ai_scope_samples,
             transcript_scroll: self.transcript_scroll,
             overlay,
             theme: self.theme,
@@ -715,7 +738,13 @@ impl App {
                     }
                 }
             }
-            InternalEvent::Transcription(result) => {
+            InternalEvent::Transcription {
+                operation_id,
+                result,
+            } => {
+                if !self.is_current_voice_operation(operation_id) {
+                    return Ok(());
+                }
                 self.voice_cancel = None;
                 match result {
                     Ok(text) => {
@@ -730,7 +759,13 @@ impl App {
                     }
                 }
             }
-            InternalEvent::TtsChunk(bytes) => {
+            InternalEvent::TtsChunk {
+                operation_id,
+                bytes,
+            } => {
+                if !self.is_current_voice_operation(operation_id) {
+                    return Ok(());
+                }
                 if let Some(playback) = self.playback.as_mut() {
                     playback.enqueue_pcm16(&bytes, QWEN_TTS_SAMPLE_RATE);
                     self.voice_state = VoiceState::Speaking;
@@ -738,22 +773,30 @@ impl App {
                     self.status = Some("AI VOICE // streaming local Qwen synthesis".to_owned());
                 }
             }
-            InternalEvent::TtsFinished(result) => match result {
-                Ok(()) => {
-                    self.voice_cancel = None;
-                    self.tts_response_finished = true;
+            InternalEvent::TtsFinished {
+                operation_id,
+                result,
+            } => {
+                if !self.is_current_voice_operation(operation_id) {
+                    return Ok(());
                 }
-                Err(error) => {
-                    self.voice_cancel = None;
-                    if let Some(playback) = self.playback.take() {
-                        playback.stop();
+                match result {
+                    Ok(()) => {
+                        self.voice_cancel = None;
+                        self.tts_response_finished = true;
                     }
-                    self.tts_response_finished = false;
-                    self.voice_state = VoiceState::Failed;
-                    self.activity = ActivityState::Failed;
-                    self.status = Some(format!("SPEECH SYNTHESIS FAILED // {error}"));
+                    Err(error) => {
+                        self.voice_cancel = None;
+                        if let Some(playback) = self.playback.take() {
+                            playback.stop();
+                        }
+                        self.tts_response_finished = false;
+                        self.voice_state = VoiceState::Failed;
+                        self.activity = ActivityState::Failed;
+                        self.status = Some(format!("SPEECH SYNTHESIS FAILED // {error}"));
+                    }
                 }
-            },
+            }
         }
         self.dirty = true;
         Ok(())
@@ -846,6 +889,7 @@ impl App {
             let level = capture.level();
             let problem = capture.has_problem();
             push_signal(&mut self.input_signal_samples, level.max(1));
+            self.user_scope_samples = capture.waveform();
             if problem {
                 self.status = Some(
                     "MICROPHONE BUFFER PRESSURE // capture remains bounded; stop and retry"
@@ -853,17 +897,22 @@ impl App {
                 );
             }
             self.dirty = true;
+        } else if decay_waveform(&mut self.user_scope_samples) {
+            self.dirty = true;
         }
         if let Some(playback) = self.playback.as_ref() {
             let level = playback.level();
             let problem = playback.has_problem();
             push_signal(&mut self.signal_samples, level.max(1));
+            self.ai_scope_samples = playback.waveform();
             if problem {
                 self.status = Some(
                     "OUTPUT BUFFER PRESSURE // some synthesized audio may have been dropped"
                         .to_owned(),
                 );
             }
+            self.dirty = true;
+        } else if decay_waveform(&mut self.ai_scope_samples) {
             self.dirty = true;
         }
         if self.tts_response_finished
@@ -873,6 +922,7 @@ impl App {
                 .is_some_and(PlaybackSession::is_empty)
         {
             if let Some(playback) = self.playback.take() {
+                self.ai_scope_samples = playback.waveform();
                 playback.stop();
             }
             self.tts_response_finished = false;
@@ -999,13 +1049,13 @@ impl App {
     }
 
     fn cancel_voice(&mut self) {
-        if let Some(cancellation) = self.voice_cancel.take() {
-            cancellation.cancel();
-        }
+        self.invalidate_voice_operation();
         if let Some(capture) = self.capture.take() {
+            self.user_scope_samples = capture.waveform();
             drop(capture.finish());
         }
         if let Some(playback) = self.playback.take() {
+            self.ai_scope_samples = playback.waveform();
             playback.stop();
         }
         self.tts_response_finished = false;
@@ -1015,6 +1065,24 @@ impl App {
             VoiceState::Disarmed
         };
         self.dirty = true;
+    }
+
+    fn invalidate_voice_operation(&mut self) {
+        if let Some(cancellation) = self.voice_cancel.take() {
+            cancellation.cancel();
+        }
+        self.voice_operation_id = self.voice_operation_id.wrapping_add(1);
+    }
+
+    fn begin_voice_operation(&mut self) -> (u64, CancellationToken) {
+        self.invalidate_voice_operation();
+        let cancellation = CancellationToken::new();
+        self.voice_cancel = Some(cancellation.clone());
+        (self.voice_operation_id, cancellation)
+    }
+
+    fn is_current_voice_operation(&self, operation_id: u64) -> bool {
+        operation_id == self.voice_operation_id
     }
 
     async fn request_quit(&mut self) -> Result<()> {
@@ -1201,6 +1269,7 @@ impl App {
         let Some(capture) = self.capture.take() else {
             return;
         };
+        self.user_scope_samples = capture.waveform();
         let audio = capture.finish();
         if audio.duration_seconds() < 0.25 {
             self.voice_state = VoiceState::Ready;
@@ -1222,8 +1291,7 @@ impl App {
             wav,
             language: None,
         };
-        let cancellation = CancellationToken::new();
-        self.voice_cancel = Some(cancellation.clone());
+        let (operation_id, cancellation) = self.begin_voice_operation();
         self.voice_state = VoiceState::Transcribing;
         self.status = Some(format!(
             "QWEN ASR // decoding {:.1}s locally",
@@ -1237,7 +1305,12 @@ impl App {
                 return;
             }
             let result = result.map_err(|error| error.to_string());
-            let _ = tx.send(InternalEvent::Transcription(result)).await;
+            let _ = tx
+                .send(InternalEvent::Transcription {
+                    operation_id,
+                    result,
+                })
+                .await;
         });
         self.dirty = true;
     }
@@ -1271,8 +1344,7 @@ impl App {
             spoken,
             self.config.speech.tts_voice.clone(),
         );
-        let cancellation = CancellationToken::new();
-        self.voice_cancel = Some(cancellation.clone());
+        let (operation_id, cancellation) = self.begin_voice_operation();
         let speech = Arc::clone(&self.speech);
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
@@ -1281,7 +1353,10 @@ impl App {
                 Err(SpeechFailure::Cancelled) => return,
                 Err(error) => {
                     let _ = tx
-                        .send(InternalEvent::TtsFinished(Err(error.to_string())))
+                        .send(InternalEvent::TtsFinished {
+                            operation_id,
+                            result: Err(error.to_string()),
+                        })
                         .await;
                     return;
                 }
@@ -1294,8 +1369,14 @@ impl App {
                 };
                 match item {
                     Some(Ok(bytes)) => {
+                        if cancellation.is_cancelled() {
+                            return;
+                        }
                         if tx
-                            .send(InternalEvent::TtsChunk(bytes.to_vec()))
+                            .send(InternalEvent::TtsChunk {
+                                operation_id,
+                                bytes: bytes.to_vec(),
+                            })
                             .await
                             .is_err()
                         {
@@ -1304,12 +1385,23 @@ impl App {
                     }
                     Some(Err(error)) => {
                         let _ = tx
-                            .send(InternalEvent::TtsFinished(Err(error.to_string())))
+                            .send(InternalEvent::TtsFinished {
+                                operation_id,
+                                result: Err(error.to_string()),
+                            })
                             .await;
                         return;
                     }
                     None => {
-                        let _ = tx.send(InternalEvent::TtsFinished(Ok(()))).await;
+                        if cancellation.is_cancelled() {
+                            return;
+                        }
+                        let _ = tx
+                            .send(InternalEvent::TtsFinished {
+                                operation_id,
+                                result: Ok(()),
+                            })
+                            .await;
                         return;
                     }
                 }
@@ -1586,6 +1678,23 @@ fn decay_signal(samples: &mut VecDeque<u64>) -> bool {
     next > 0
 }
 
+fn decay_waveform(samples: &mut Vec<f32>) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+    let mut active = false;
+    for sample in samples.iter_mut() {
+        *sample *= 0.72;
+        if sample.abs() > 0.01 {
+            active = true;
+        }
+    }
+    if !active {
+        samples.clear();
+    }
+    active
+}
+
 fn model_detail(model: &SelectedModel) -> Option<String> {
     let mut details = Vec::new();
     if let Some(parameter_size) = &model.summary.details.parameter_size {
@@ -1774,6 +1883,18 @@ mod tests {
     }
 
     #[test]
+    fn waveforms_decay_toward_silence_and_then_clear() {
+        let mut samples = vec![0.5, -0.4, 0.2];
+        assert!(decay_waveform(&mut samples));
+        assert!(samples.iter().all(|sample| sample.abs() < 0.5));
+        for _ in 0..20 {
+            let _ = decay_waveform(&mut samples);
+        }
+        assert!(samples.is_empty());
+        assert!(!decay_waveform(&mut samples));
+    }
+
+    #[test]
     fn formats_loaded_model_size() {
         assert_eq!(format_bytes(6 * 1024 * 1024 * 1024), "6.0 GiB");
         assert_eq!(format_bytes(512 * 1024 * 1024), "512 MiB");
@@ -1951,5 +2072,83 @@ mod tests {
             loaded.messages[0].finish_reason.as_deref(),
             Some("shutdown")
         );
+    }
+
+    #[tokio::test]
+    async fn stale_transcription_does_not_submit_or_clear_the_current_operation() {
+        let (_temporary, mut app) = test_app().await;
+        app.selected_model = Some(SelectedModel {
+            summary: ModelSummary {
+                name: "qwen".to_owned(),
+                ..ModelSummary::default()
+            },
+            ..SelectedModel::default()
+        });
+        app.voice_mode = true;
+        app.voice_state = VoiceState::Transcribing;
+        app.voice_operation_id = 7;
+        let token = CancellationToken::new();
+        app.voice_cancel = Some(token.clone());
+
+        app.handle_internal_event(InternalEvent::Transcription {
+            operation_id: 6,
+            result: Ok("stale utterance".to_owned()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.voice_state, VoiceState::Transcribing);
+        assert!(app.voice_cancel.is_some());
+        assert!(!token.is_cancelled());
+        assert!(app.session.messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn current_transcription_submits_decoded_text() {
+        let (_temporary, mut app) = test_app().await;
+        app.selected_model = Some(SelectedModel {
+            summary: ModelSummary {
+                name: "qwen".to_owned(),
+                ..ModelSummary::default()
+            },
+            ..SelectedModel::default()
+        });
+        app.voice_mode = true;
+        app.voice_state = VoiceState::Transcribing;
+        app.voice_operation_id = 3;
+        app.voice_cancel = Some(CancellationToken::new());
+
+        app.handle_internal_event(InternalEvent::Transcription {
+            operation_id: 3,
+            result: Ok("hello from this turn".to_owned()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.session.messages[0].origin, MessageOrigin::Speech);
+        assert_eq!(app.session.messages[0].content, "hello from this turn");
+        assert!(app.voice_cancel.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_tts_failure_does_not_fail_the_current_operation() {
+        let (_temporary, mut app) = test_app().await;
+        app.voice_mode = true;
+        app.voice_state = VoiceState::Speaking;
+        app.voice_operation_id = 4;
+        let token = CancellationToken::new();
+        app.voice_cancel = Some(token.clone());
+
+        app.handle_internal_event(InternalEvent::TtsFinished {
+            operation_id: 3,
+            result: Err("late synthesis".to_owned()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.voice_state, VoiceState::Speaking);
+        assert!(app.voice_cancel.is_some());
+        assert!(!token.is_cancelled());
+        assert_ne!(app.activity, ActivityState::Failed);
     }
 }

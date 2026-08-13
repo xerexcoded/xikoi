@@ -2,12 +2,15 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
 use reqwest::{Client, Response, StatusCode, multipart};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use url::Url;
+
+use crate::http_limits::{
+    LimitedBodyError, MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES, read_limited_body,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(30);
 
@@ -116,11 +119,22 @@ impl MlxAudioClient {
             () = cancellation.cancelled() => return Err(SpeechFailure::Cancelled),
             response = dispatch => response.map_err(SpeechFailure::Transport)?,
         };
+        if cancellation.is_cancelled() {
+            return Err(SpeechFailure::Cancelled);
+        }
         let response = ensure_success(response).await?;
-        let parsed = response
-            .json::<TranscriptionResponse>()
+        if cancellation.is_cancelled() {
+            return Err(SpeechFailure::Cancelled);
+        }
+        let body = read_limited_body(response, MAX_JSON_BODY_BYTES)
             .await
-            .map_err(SpeechFailure::Transport)?;
+            .map_err(speech_body_failure)?;
+        if cancellation.is_cancelled() {
+            return Err(SpeechFailure::Cancelled);
+        }
+        let parsed = serde_json::from_slice::<TranscriptionResponse>(&body).map_err(|error| {
+            SpeechFailure::Protocol(format!("MLX-Audio returned invalid JSON: {error}"))
+        })?;
         let text = parsed.text.trim().to_owned();
         if text.is_empty() {
             return Err(SpeechFailure::Protocol(
@@ -162,14 +176,25 @@ async fn ensure_success(response: Response) -> Result<Response, SpeechFailure> {
     if status.is_success() {
         return Ok(response);
     }
-    let body = response.bytes().await.map_err(SpeechFailure::Transport)?;
+    let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
+        .await
+        .map_err(speech_body_failure)?;
     Err(SpeechFailure::Server {
         status,
         message: bounded_body(&body),
     })
 }
 
-fn bounded_body(body: &Bytes) -> String {
+fn speech_body_failure(error: LimitedBodyError) -> SpeechFailure {
+    match error {
+        LimitedBodyError::TooLarge { limit } => SpeechFailure::Protocol(format!(
+            "MLX-Audio returned a response larger than {limit} bytes"
+        )),
+        LimitedBodyError::Transport(error) => SpeechFailure::Transport(error),
+    }
+}
+
+fn bounded_body(body: &[u8]) -> String {
     const LIMIT: usize = 512;
     let text = String::from_utf8_lossy(body);
     let mut chars = text.chars();
@@ -245,5 +270,66 @@ mod tests {
         assert_eq!(value["response_format"], "pcm");
         assert_eq!(value["stream"], true);
         assert_eq!(value["streaming_interval"], 0.5);
+    }
+
+    #[tokio::test]
+    async fn cancelled_transcription_does_not_return_late_text() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(400))
+                    .set_body_json(serde_json::json!({ "text": "late text" })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = MlxAudioClient::new(Url::parse(&server.uri()).unwrap()).unwrap();
+        let cancellation = CancellationToken::new();
+        let cancel = cancellation.clone();
+        let task = tokio::spawn(async move {
+            client
+                .transcribe(
+                    TranscriptionRequest {
+                        model: "qwen-asr".to_owned(),
+                        wav: b"not-a-real-wav".to_vec(),
+                        language: None,
+                    },
+                    &cancellation,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        let result = task.await.unwrap();
+        assert!(matches!(result, Err(SpeechFailure::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn transcription_rejects_oversized_error_bodies() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/audio/transcriptions"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_raw(vec![b'x'; MAX_ERROR_BODY_BYTES + 8], "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let client = MlxAudioClient::new(Url::parse(&server.uri()).unwrap()).unwrap();
+        let error = client
+            .transcribe(
+                TranscriptionRequest {
+                    model: "qwen-asr".to_owned(),
+                    wav: b"not-a-real-wav".to_vec(),
+                    language: None,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("oversized transcription error must fail");
+        assert!(matches!(error, SpeechFailure::Protocol(message) if message.contains("bytes")));
     }
 }

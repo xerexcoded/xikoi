@@ -5,6 +5,8 @@
 
 mod markdown;
 mod render;
+mod sanitize;
+mod scope;
 mod theme;
 
 use ratatui_textarea::TextArea;
@@ -13,6 +15,8 @@ use crate::{audio::AudioDirection, config::ColorMode, domain::ChatMessage};
 
 pub use markdown::{markdown_lines, message_lines, wrap_lines};
 pub use render::{LayoutClass, layout_class, render};
+pub use sanitize::sanitize_terminal_text;
+pub use scope::{ascii_waveform, render_dual_scopes, render_scope, scope_trace};
 pub use theme::{ColorProfile, Theme, ThemeOptions};
 
 /// Current Ollama link state shown in the activity strip.
@@ -270,6 +274,10 @@ pub struct UiView<'a, 'input> {
     pub link_signal_samples: &'a [u64],
     /// Rolling composer activity samples, such as recent keystroke energy.
     pub input_signal_samples: &'a [u64],
+    /// Latest microphone PCM window for the user oscilloscope.
+    pub user_scope_samples: &'a [f32],
+    /// Latest synthesized-speaker PCM window for the AI oscilloscope.
+    pub ai_scope_samples: &'a [f32],
     pub transcript_scroll: TranscriptScroll,
     pub overlay: Option<OverlayView<'a>>,
     pub theme: ThemeOptions,
@@ -292,6 +300,8 @@ impl<'a, 'input> UiView<'a, 'input> {
             voice: VoiceView::default(),
             link_signal_samples: &[],
             input_signal_samples: &[],
+            user_scope_samples: &[],
+            ai_scope_samples: &[],
             transcript_scroll: TranscriptScroll::following_tail(),
             overlay: None,
             theme: ThemeOptions::new(ColorMode::Auto),

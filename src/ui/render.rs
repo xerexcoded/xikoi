@@ -15,7 +15,8 @@ use crate::{audio::AudioDirection, domain::ChatMessage};
 
 use super::{
     ActivityState, AudioChoice, HelpBinding, InteractionMode, ModelChoice, OverlayView,
-    SessionChoice, TelemetryView, Theme, UiView, VoiceState, markdown::message_lines, wrap_lines,
+    SessionChoice, TelemetryView, Theme, UiView, VoiceState, markdown::message_lines, render_scope,
+    sanitize_terminal_text, wrap_lines,
 };
 
 const WIDE_MIN_WIDTH: u16 = 110;
@@ -147,7 +148,12 @@ fn render_wide_activity_strip(
     if area.is_empty() {
         return;
     }
-    let block = panel_block(" XIKOI // LINK ACTIVITY // NEURAL SIGNAL ", theme);
+    let title = if view.voice.mode == InteractionMode::Voice {
+        " XIKOI // VOICE SCOPE // AI "
+    } else {
+        " XIKOI // LINK ACTIVITY // NEURAL SIGNAL "
+    };
+    let block = panel_block(title, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -160,7 +166,11 @@ fn render_wide_activity_strip(
         Paragraph::new(Line::from(activity_status_spans(view, theme, true))).style(theme.panel),
         status,
     );
-    render_link_signal(frame, signal, view, theme);
+    if view.voice.mode == InteractionMode::Voice {
+        render_ai_scope(frame, signal, view, theme);
+    } else {
+        render_link_signal(frame, signal, view, theme);
+    }
 }
 
 fn render_minimal_activity(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, theme: Theme) {
@@ -205,7 +215,7 @@ fn render_activity_strip(
     }
     if let Some(message) = view.status_message {
         frame.render_widget(
-            Paragraph::new(message)
+            Paragraph::new(sanitize_terminal_text(message))
                 .style(if matches!(view.activity, super::ActivityState::Failed) {
                     theme.danger
                 } else {
@@ -249,7 +259,7 @@ fn activity_status_spans(
     if include_message && let Some(message) = view.status_message {
         spans.push(Span::styled("  //  ".to_owned(), theme.muted));
         spans.push(Span::styled(
-            message.to_owned(),
+            sanitize_terminal_text(message),
             if matches!(view.activity, ActivityState::Failed) {
                 theme.danger
             } else {
@@ -403,15 +413,6 @@ fn render_input(
 }
 
 fn render_voice_deck(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, theme: Theme) {
-    let signal = if matches!(
-        view.voice.state,
-        VoiceState::Speaking | VoiceState::Synthesizing
-    ) {
-        view.link_signal_samples
-    } else {
-        view.input_signal_samples
-    };
-    let waveform = ascii_signal(signal, usize::from(area.width.saturating_sub(4)));
     let state_style = if view.voice.state == VoiceState::Failed {
         theme.danger
     } else if matches!(
@@ -427,29 +428,83 @@ fn render_voice_deck(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, t
     } else {
         "MLX OFFLINE"
     };
-    let compact = area.height < 4;
-    let mut lines = vec![Line::from(vec![
+    let header = Line::from(vec![
         Span::styled(" NEURAL VOICE // ", theme.muted),
         Span::styled(view.voice.state.label().to_owned(), state_style),
         Span::styled(format!(" // {server}"), theme.muted),
-    ])];
-    if compact {
-        lines.push(Line::styled(waveform, state_style));
-    } else {
-        let core = if theme.ascii {
-            format!(" <[{waveform}]> ")
-        } else {
-            format!(" ◢◤ {waveform} ◥◣ ")
-        };
-        lines.push(Line::styled(core, state_style).alignment(Alignment::Center));
-        lines.push(Line::from(vec![
-            Span::styled(" MIC ", theme.muted),
-            Span::styled(view.voice.input_device.to_owned(), theme.text),
-            Span::styled("  //  OUT ", theme.muted),
-            Span::styled(view.voice.output_device.to_owned(), theme.text),
-        ]));
+    ]);
+
+    if area.height <= 1 {
+        frame.render_widget(Paragraph::new(header).style(theme.panel), area);
+        return;
     }
-    frame.render_widget(Paragraph::new(lines).style(theme.panel), area);
+
+    if area.height < 4 {
+        let [header_area, waves] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+        frame.render_widget(Paragraph::new(header).style(theme.panel), header_area);
+        render_user_scope(frame, waves, view, theme);
+        return;
+    }
+
+    let show_devices = area.height >= 6;
+    if show_devices {
+        let [header_area, scopes, devices] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        frame.render_widget(Paragraph::new(header).style(theme.panel), header_area);
+        render_user_scope(frame, scopes, view, theme);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" MIC ", theme.muted),
+                Span::styled(view.voice.input_device.to_owned(), theme.text),
+                Span::styled("  //  OUT ", theme.muted),
+                Span::styled(view.voice.output_device.to_owned(), theme.text),
+            ]))
+            .style(theme.panel),
+            devices,
+        );
+    } else {
+        let [header_area, scopes] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+        frame.render_widget(Paragraph::new(header).style(theme.panel), header_area);
+        render_user_scope(frame, scopes, view, theme);
+    }
+}
+
+fn render_user_scope(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, theme: Theme) {
+    let user_style = if view.voice.state == VoiceState::Listening {
+        theme.accent
+    } else if view.voice.state == VoiceState::Failed {
+        theme.danger
+    } else {
+        theme.secondary
+    };
+    render_scope(
+        frame,
+        area,
+        "USER",
+        view.user_scope_samples,
+        user_style,
+        theme,
+    );
+}
+
+fn render_ai_scope(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, theme: Theme) {
+    let ai_style = if matches!(
+        view.voice.state,
+        VoiceState::Speaking | VoiceState::Synthesizing
+    ) {
+        theme.accent
+    } else if view.voice.state == VoiceState::Failed {
+        theme.danger
+    } else {
+        theme.secondary
+    };
+    render_scope(frame, area, "AI", view.ai_scope_samples, ai_style, theme);
 }
 
 fn render_input_signal(frame: &mut Frame<'_>, area: Rect, samples: &[u64], theme: Theme) {
@@ -1457,6 +1512,76 @@ mod tests {
         assert!(output.contains("NEURAL VOICE"));
         assert!(output.contains("MacBook Air Microphone"));
         assert!(output.contains("MacBook Air Speakers"));
+        assert!(output.contains("USER SCOPE"));
+        assert!(output.contains("AI SCOPE"));
+        assert!(output.contains("VOICE SCOPE // AI"));
+        let visualizer = output.lines().take(8).collect::<Vec<_>>().join("\n");
+        let deck = output.lines().skip(8).collect::<Vec<_>>().join("\n");
+        assert!(
+            visualizer.contains("AI SCOPE") && !visualizer.contains("USER SCOPE"),
+            "AI scope belongs in the top visualizer:\n{visualizer}"
+        );
+        assert!(
+            deck.contains("USER SCOPE") && !deck.contains("AI SCOPE"),
+            "user scope belongs in the voice deck:\n{deck}"
+        );
+    }
+
+    #[test]
+    fn voice_mode_renders_independent_user_and_ai_oscilloscopes() {
+        #[allow(clippy::cast_precision_loss)]
+        let user: &'static [f32] = Box::leak(
+            (0..96)
+                .map(|index| (index as f32 * 0.4).sin() * 0.9)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        #[allow(clippy::cast_precision_loss)]
+        let ai: &'static [f32] = Box::leak(
+            (0..96)
+                .map(|index| (index as f32 * 0.55).cos() * 0.7)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        let output = rendered(120, 40, |view| {
+            view.voice = VoiceView {
+                mode: InteractionMode::Voice,
+                state: VoiceState::Speaking,
+                speech_online: true,
+                input_device: "MacBook Air Microphone",
+                output_device: "MacBook Air Speakers",
+                asr_model: "qwen-asr",
+                tts_model: "qwen-tts",
+            };
+            view.user_scope_samples = user;
+            view.ai_scope_samples = ai;
+        });
+        assert!(output.contains("USER SCOPE"));
+        assert!(output.contains("AI SCOPE"));
+        assert!(output.contains("LIVE"));
+        assert!(output.contains("VOICE SCOPE // AI"));
+        assert!(!output.contains("VOICE SCOPE // USER + AI"));
+        let visualizer = output.lines().take(8).collect::<Vec<_>>().join("\n");
+        let deck = output.lines().skip(8).collect::<Vec<_>>().join("\n");
+        assert!(
+            visualizer.contains("AI SCOPE") && !visualizer.contains("USER SCOPE"),
+            "top visualizer should show only the AI oscilloscope:\n{visualizer}"
+        );
+        assert!(
+            deck.contains("USER SCOPE") && !deck.contains("AI SCOPE"),
+            "voice deck should show only the user oscilloscope:\n{deck}"
+        );
+        let visualizer_rows = visualizer
+            .lines()
+            .filter(|line| {
+                line.chars()
+                    .any(|character| !character.is_ascii() || ".:-=+*#%@".contains(character))
+            })
+            .count();
+        assert!(
+            visualizer_rows >= 2,
+            "AI oscilloscope should occupy the wide visualizer:\n{output}"
+        );
     }
 
     #[test]

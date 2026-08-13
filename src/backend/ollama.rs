@@ -12,9 +12,15 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use super::{ChatBackend, ChatEventReceiver};
-use crate::domain::{
-    BackendErrorKind, BackendFailure, BackendInfo, ChatEvent, ChatRequest, ModelDetails,
-    ModelSummary, SelectedModel, Usage,
+use crate::{
+    domain::{
+        BackendErrorKind, BackendFailure, BackendInfo, ChatEvent, ChatRequest, ModelDetails,
+        ModelSummary, SelectedModel, Usage,
+    },
+    http_limits::{
+        CONNECT_TIMEOUT, LimitedBodyError, MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES,
+        REQUEST_TIMEOUT, read_limited_body,
+    },
 };
 
 const MAX_NDJSON_LINE_BYTES: usize = 16 * 1024 * 1024;
@@ -24,12 +30,13 @@ const CHAT_EVENT_CHANNEL_CAPACITY: usize = 256;
 pub struct OllamaBackend {
     base_url: Url,
     client: Client,
+    request_timeout: Duration,
 }
 
 impl OllamaBackend {
     pub fn new(base_url: Url) -> Result<Self, BackendFailure> {
         let client = Client::builder()
-            .connect_timeout(Duration::from_secs(3))
+            .connect_timeout(CONNECT_TIMEOUT)
             .user_agent(concat!("xikoi/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|error| BackendFailure {
@@ -43,6 +50,7 @@ impl OllamaBackend {
         Self {
             base_url: normalize_base_url(base_url),
             client,
+            request_timeout: REQUEST_TIMEOUT,
         }
     }
 
@@ -60,6 +68,7 @@ impl OllamaBackend {
         let response = self
             .client
             .get(url)
+            .timeout(self.request_timeout)
             .send()
             .await
             .map_err(|error| self.transport_failure(&error))?;
@@ -75,6 +84,7 @@ impl OllamaBackend {
         let response = self
             .client
             .post(url)
+            .timeout(self.request_timeout)
             .json(body)
             .send()
             .await
@@ -87,15 +97,28 @@ impl OllamaBackend {
         T: DeserializeOwned,
     {
         let status = response.status();
-        let body = response
-            .bytes()
+        let limit = if status.is_success() {
+            MAX_JSON_BODY_BYTES
+        } else {
+            MAX_ERROR_BODY_BYTES
+        };
+        let body = read_limited_body(response, limit)
             .await
-            .map_err(|error| self.transport_failure(&error))?;
+            .map_err(|error| self.limited_body_failure(error))?;
         if !status.is_success() {
             return Err(status_failure(status, &body));
         }
         serde_json::from_slice(&body)
             .map_err(|error| protocol_failure(format!("Ollama returned invalid JSON: {error}")))
+    }
+
+    fn limited_body_failure(&self, error: LimitedBodyError) -> BackendFailure {
+        match error {
+            LimitedBodyError::TooLarge { limit } => protocol_failure(format!(
+                "Ollama returned a response larger than {limit} bytes"
+            )),
+            LimitedBodyError::Transport(error) => self.transport_failure(&error),
+        }
     }
 
     fn transport_failure(&self, error: &reqwest::Error) -> BackendFailure {
@@ -129,10 +152,9 @@ impl OllamaBackend {
             .map_err(|error| self.transport_failure(&error))?;
         let status = response.status();
         if !status.is_success() {
-            let body = response
-                .bytes()
+            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
                 .await
-                .map_err(|error| self.transport_failure(&error))?;
+                .map_err(|error| self.limited_body_failure(error))?;
             return Err(status_failure(status, &body));
         }
 
@@ -302,10 +324,9 @@ impl ChatBackend for OllamaBackend {
 
         let status = response.status();
         if !status.is_success() {
-            let body = response
-                .bytes()
+            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
                 .await
-                .map_err(|error| self.transport_failure(&error))?;
+                .map_err(|error| self.limited_body_failure(error))?;
             return Err(status_failure(status, &body));
         }
 
@@ -513,29 +534,34 @@ struct NdjsonFramer {
 
 impl NdjsonFramer {
     fn push(&mut self, bytes: &[u8]) -> Result<Vec<Bytes>, BackendFailure> {
-        self.buffer.extend_from_slice(bytes);
+        let mut offset = 0;
         let mut lines = Vec::new();
 
-        while let Some(newline) = self.buffer.iter().position(|byte| *byte == b'\n') {
-            let mut line = self.buffer.split_to(newline + 1);
-            line.truncate(newline);
-            if line.last() == Some(&b'\r') {
-                line.truncate(line.len() - 1);
-            }
-            if line.len() > MAX_NDJSON_LINE_BYTES {
+        while let Some(relative) = bytes[offset..].iter().position(|byte| *byte == b'\n') {
+            let end = offset + relative;
+            let line_len = self.buffer.len().saturating_add(end.saturating_sub(offset));
+            if line_len > MAX_NDJSON_LINE_BYTES {
                 return Err(protocol_failure(format!(
                     "Ollama returned a stream record larger than {MAX_NDJSON_LINE_BYTES} bytes"
                 )));
             }
-            if !line.is_empty() {
-                lines.push(line.freeze());
+            self.buffer.extend_from_slice(&bytes[offset..end]);
+            if self.buffer.last() == Some(&b'\r') {
+                self.buffer.truncate(self.buffer.len() - 1);
             }
+            if !self.buffer.is_empty() {
+                lines.push(self.buffer.split().freeze());
+            }
+            offset = end + 1;
         }
 
-        if self.buffer.len() > MAX_NDJSON_LINE_BYTES {
-            return Err(protocol_failure(format!(
-                "Ollama returned a stream record larger than {MAX_NDJSON_LINE_BYTES} bytes"
-            )));
+        if offset < bytes.len() {
+            self.buffer.extend_from_slice(&bytes[offset..]);
+            if self.buffer.len() > MAX_NDJSON_LINE_BYTES {
+                return Err(protocol_failure(format!(
+                    "Ollama returned a stream record larger than {MAX_NDJSON_LINE_BYTES} bytes"
+                )));
+            }
         }
         Ok(lines)
     }
@@ -1252,6 +1278,16 @@ mod tests {
     }
 
     #[test]
+    fn framing_rejects_a_newline_terminated_record_over_the_limit() {
+        let mut record = vec![b'x'; MAX_NDJSON_LINE_BYTES + 1];
+        record.push(b'\n');
+        let error = NdjsonFramer::default()
+            .push(&record)
+            .expect_err("a 16 MiB-plus NDJSON record with a trailing newline must be rejected");
+        assert_eq!(error.kind, BackendErrorKind::Protocol);
+    }
+
+    #[test]
     fn dynamic_context_does_not_guess_from_an_unrelated_architecture() {
         let info = Map::from_iter([
             ("general.architecture".to_owned(), json!("qwen3")),
@@ -1278,5 +1314,52 @@ mod tests {
         let backend =
             OllamaBackend::with_client(Url::parse("http://127.0.0.1:11434").unwrap(), client);
         accept_backend(Arc::new(backend));
+    }
+
+    #[tokio::test]
+    async fn probe_times_out_when_the_body_stalls() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_raw(
+                        include_bytes!("../../tests/fixtures/ollama/version.json"),
+                        "application/json",
+                    )
+                    .set_delay(Duration::from_secs(30)),
+            )
+            .mount(&server)
+            .await;
+
+        let mut backend = backend(&server);
+        backend.request_timeout = Duration::from_millis(150);
+        let started = Instant::now();
+        let error = backend
+            .probe()
+            .await
+            .expect_err("stalled version must fail");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(error.kind, BackendErrorKind::Unavailable);
+    }
+
+    #[tokio::test]
+    async fn error_bodies_are_capped_before_buffering() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/version"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_raw(vec![b'x'; MAX_ERROR_BODY_BYTES + 8], "text/plain"),
+            )
+            .mount(&server)
+            .await;
+
+        let error = backend(&server)
+            .probe()
+            .await
+            .expect_err("oversized error must fail");
+        assert_eq!(error.kind, BackendErrorKind::Protocol);
+        assert!(error.message.contains("bytes"));
     }
 }

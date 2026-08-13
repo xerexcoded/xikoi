@@ -14,7 +14,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::domain::{ChatMessage, MessageOrigin, MessageStatus, Role};
 
-use super::Theme;
+use super::{Theme, sanitize_terminal_text};
 
 #[derive(Debug)]
 struct MarkdownWriter {
@@ -113,9 +113,10 @@ impl MarkdownWriter {
 /// extensions degrade to their text content.
 #[allow(clippy::match_same_arms, clippy::too_many_lines)]
 pub fn markdown_lines(markdown: &str, theme: Theme) -> Vec<Line<'static>> {
+    let markdown = sanitize_terminal_text(markdown);
     let mut writer = MarkdownWriter::new(theme);
     let parser = Parser::new_ext(
-        markdown,
+        &markdown,
         Options::ENABLE_STRIKETHROUGH
             | Options::ENABLE_TASKLISTS
             | Options::ENABLE_TABLES
@@ -265,7 +266,10 @@ pub fn message_lines(message: &ChatMessage, theme: Theme) -> Vec<Line<'static>> 
         header.push(Span::styled("  VOICE".to_owned(), theme.secondary));
     }
     if let Some(model) = message.model.as_deref() {
-        header.push(Span::styled(format!("  {model}"), theme.muted));
+        header.push(Span::styled(
+            format!("  {}", sanitize_terminal_text(model)),
+            theme.muted,
+        ));
     }
     match message.status {
         MessageStatus::Complete => {}
@@ -294,7 +298,10 @@ pub fn message_lines(message: &ChatMessage, theme: Theme) -> Vec<Line<'static>> 
         lines.extend(markdown_lines(&message.content, theme));
     }
     if let Some(error) = message.error.as_deref() {
-        lines.push(Line::styled(format!("ERROR // {error}"), theme.danger));
+        lines.push(Line::styled(
+            format!("ERROR // {}", sanitize_terminal_text(error)),
+            theme.danger,
+        ));
     }
     lines.push(Line::default());
     lines
@@ -491,5 +498,44 @@ mod tests {
         assert!(rendered.contains(" | "));
         assert!(rendered.contains("| local()"));
         assert!(!rendered.contains('│'));
+    }
+
+    #[test]
+    fn control_sequences_cannot_reach_rendered_spans() {
+        let payload =
+            "safe\u{1b}]52;c;SSBzdG9sZSB5b3VyIGNsaXBib2FyZA==\u{07} text \u{1b}[31mred\u{1b}[0m";
+        let message = ChatMessage {
+            id: Uuid::now_v7(),
+            created_at: Utc::now(),
+            role: Role::Assistant,
+            content: payload.to_owned(),
+            origin: MessageOrigin::Generated,
+            status: MessageStatus::Failed,
+            model: Some("qwen\u{1b}]0;hijack\u{07}".into()),
+            finish_reason: None,
+            usage: None,
+            error: Some("boom\u{1b}[2J".to_owned()),
+        };
+        let rendered = message_lines(&message, theme())
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rendered.contains("safe"));
+        assert!(rendered.contains("text"));
+        assert!(rendered.contains("red"));
+        assert!(rendered.contains("ERROR // boom"));
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "ESC must not reach the terminal: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{07}'),
+            "BEL must not reach the terminal: {rendered:?}"
+        );
+        assert!(
+            !rendered.chars().any(char::is_control),
+            "control bytes leaked into spans: {rendered:?}"
+        );
     }
 }

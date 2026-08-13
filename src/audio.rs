@@ -7,7 +7,7 @@ use std::{
     io::Cursor,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering},
     },
 };
 
@@ -23,6 +23,9 @@ const MAX_CAPTURE_SECONDS: usize = 120;
 const PLAYBACK_QUEUE_SECONDS: usize = 120;
 pub const ASR_SAMPLE_RATE: u32 = 16_000;
 pub const QWEN_TTS_SAMPLE_RATE: u32 = 24_000;
+/// Recent mono PCM kept for the voice oscilloscope. Power of two so wraparound
+/// snapshots stay ordered after the write index overflows.
+pub const SCOPE_WINDOW: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioDirection {
@@ -76,6 +79,53 @@ impl AudioInventory {
     }
 }
 
+/// Lock-free mono PCM ring for oscilloscope visualization.
+pub struct WaveformTrace {
+    slots: Box<[AtomicU32]>,
+    write: AtomicUsize,
+    filled: AtomicUsize,
+}
+
+impl WaveformTrace {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            slots: (0..capacity)
+                .map(|_| AtomicU32::new(0.0f32.to_bits()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            write: AtomicUsize::new(0),
+            filled: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn push(&self, sample: f32) {
+        let index = self.write.fetch_add(1, Ordering::Relaxed);
+        self.slots[index % self.slots.len()].store(sample.to_bits(), Ordering::Relaxed);
+        let cap = self.slots.len();
+        let _ = self
+            .filled
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1).min(cap))
+            });
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> Vec<f32> {
+        let cap = self.slots.len();
+        let filled = self.filled.load(Ordering::Relaxed).min(cap);
+        let write = self.write.load(Ordering::Relaxed);
+        let start = write.wrapping_sub(filled);
+        (0..filled)
+            .map(|offset| {
+                let index = start.wrapping_add(offset) % cap;
+                f32::from_bits(self.slots[index].load(Ordering::Relaxed))
+            })
+            .collect()
+    }
+}
+
 pub struct CaptureSession {
     stream: Stream,
     samples: Arc<ArrayQueue<f32>>,
@@ -85,6 +135,7 @@ pub struct CaptureSession {
     level: Arc<AtomicU32>,
     overflowed: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    waveform: Arc<WaveformTrace>,
     pub device_id: String,
     pub device_name: String,
 }
@@ -108,6 +159,7 @@ impl CaptureSession {
         let level = Arc::new(AtomicU32::new(0));
         let overflowed = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
+        let waveform = Arc::new(WaveformTrace::new(SCOPE_WINDOW));
         let config = supported.config();
 
         let stream = match supported.sample_format() {
@@ -119,6 +171,7 @@ impl CaptureSession {
                 Arc::clone(&level),
                 Arc::clone(&overflowed),
                 Arc::clone(&failed),
+                Arc::clone(&waveform),
             )?,
             SampleFormat::I16 => build_input_stream::<i16>(
                 &device,
@@ -128,6 +181,7 @@ impl CaptureSession {
                 Arc::clone(&level),
                 Arc::clone(&overflowed),
                 Arc::clone(&failed),
+                Arc::clone(&waveform),
             )?,
             SampleFormat::U16 => build_input_stream::<u16>(
                 &device,
@@ -137,6 +191,7 @@ impl CaptureSession {
                 Arc::clone(&level),
                 Arc::clone(&overflowed),
                 Arc::clone(&failed),
+                Arc::clone(&waveform),
             )?,
             format => return Err(AudioFailure::UnsupportedSampleFormat(format)),
         };
@@ -151,6 +206,7 @@ impl CaptureSession {
             level,
             overflowed,
             failed,
+            waveform,
             device_id,
             device_name,
         })
@@ -171,6 +227,11 @@ impl CaptureSession {
 
     pub fn level(&self) -> u64 {
         u64::from(self.level.load(Ordering::Relaxed))
+    }
+
+    #[must_use]
+    pub fn waveform(&self) -> Vec<f32> {
+        self.waveform.snapshot()
     }
 
     pub fn has_problem(&self) -> bool {
@@ -194,7 +255,9 @@ pub struct PlaybackSession {
     level: Arc<AtomicU32>,
     overflowed: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    waveform: Arc<WaveformTrace>,
     pending_byte: Option<u8>,
+    resampler: LinearResampler,
     pub device_id: String,
     pub device_name: String,
 }
@@ -218,6 +281,7 @@ impl PlaybackSession {
         let level = Arc::new(AtomicU32::new(0));
         let overflowed = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
+        let waveform = Arc::new(WaveformTrace::new(SCOPE_WINDOW));
         let config = supported.config();
 
         let stream = match supported.sample_format() {
@@ -228,6 +292,7 @@ impl PlaybackSession {
                 Arc::clone(&samples),
                 Arc::clone(&level),
                 Arc::clone(&failed),
+                Arc::clone(&waveform),
             )?,
             SampleFormat::I16 => build_output_stream::<i16>(
                 &device,
@@ -236,6 +301,7 @@ impl PlaybackSession {
                 Arc::clone(&samples),
                 Arc::clone(&level),
                 Arc::clone(&failed),
+                Arc::clone(&waveform),
             )?,
             SampleFormat::U16 => build_output_stream::<u16>(
                 &device,
@@ -244,6 +310,7 @@ impl PlaybackSession {
                 Arc::clone(&samples),
                 Arc::clone(&level),
                 Arc::clone(&failed),
+                Arc::clone(&waveform),
             )?,
             format => return Err(AudioFailure::UnsupportedSampleFormat(format)),
         };
@@ -256,7 +323,9 @@ impl PlaybackSession {
             level,
             overflowed,
             failed,
+            waveform,
             pending_byte: None,
+            resampler: LinearResampler::new(QWEN_TTS_SAMPLE_RATE, sample_rate),
             device_id,
             device_name,
         })
@@ -281,7 +350,12 @@ impl PlaybackSession {
         );
         self.pending_byte = chunks.remainder().first().copied();
 
-        for sample in resample_linear(&pcm, source_rate, self.sample_rate) {
+        if self.resampler.source_rate != source_rate
+            || self.resampler.target_rate != self.sample_rate
+        {
+            self.resampler = LinearResampler::new(source_rate, self.sample_rate);
+        }
+        for sample in self.resampler.push(&pcm) {
             if self.samples.push(sample).is_err() {
                 self.overflowed.store(true, Ordering::Relaxed);
                 break;
@@ -291,6 +365,11 @@ impl PlaybackSession {
 
     pub fn level(&self) -> u64 {
         u64::from(self.level.load(Ordering::Relaxed))
+    }
+
+    #[must_use]
+    pub fn waveform(&self) -> Vec<f32> {
+        self.waveform.snapshot()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -399,7 +478,8 @@ fn select_device(
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments
 )]
 fn build_input_stream<T>(
     device: &cpal::Device,
@@ -409,6 +489,7 @@ fn build_input_stream<T>(
     level: Arc<AtomicU32>,
     overflowed: Arc<AtomicBool>,
     failed: Arc<AtomicBool>,
+    waveform: Arc<WaveformTrace>,
 ) -> Result<Stream, AudioFailure>
 where
     T: SizedSample + Copy,
@@ -425,6 +506,7 @@ where
                         / frame.len().max(1) as f32;
                     energy += mono * mono;
                     count = count.saturating_add(1);
+                    waveform.push(mono);
                     if samples.push(mono).is_err() {
                         overflowed.store(true, Ordering::Relaxed);
                     }
@@ -454,6 +536,7 @@ fn build_output_stream<T>(
     samples: Arc<ArrayQueue<f32>>,
     level: Arc<AtomicU32>,
     failed: Arc<AtomicBool>,
+    waveform: Arc<WaveformTrace>,
 ) -> Result<Stream, AudioFailure>
 where
     T: SizedSample + FromSample<f32>,
@@ -468,6 +551,7 @@ where
                     let sample = samples.pop().unwrap_or(0.0);
                     energy += sample * sample;
                     count = count.saturating_add(1);
+                    waveform.push(sample);
                     for channel in frame {
                         *channel = T::from_sample(sample);
                     }
@@ -483,6 +567,80 @@ where
             None,
         )
         .map_err(AudioFailure::Cpal)
+}
+
+/// Streaming linear interpolator that keeps phase and the previous sample
+/// across network chunk boundaries.
+#[derive(Debug)]
+pub struct LinearResampler {
+    source_rate: u32,
+    target_rate: u32,
+    step: f64,
+    position: f64,
+    buffer: Vec<f32>,
+}
+
+impl LinearResampler {
+    #[must_use]
+    pub fn new(source_rate: u32, target_rate: u32) -> Self {
+        Self {
+            source_rate,
+            target_rate,
+            step: if target_rate == 0 {
+                0.0
+            } else {
+                f64::from(source_rate) / f64::from(target_rate)
+            },
+            position: 0.0,
+            buffer: Vec::new(),
+        }
+    }
+
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
+    pub fn push(&mut self, input: &[f32]) -> Vec<f32> {
+        if input.is_empty() || self.source_rate == 0 || self.target_rate == 0 {
+            return Vec::new();
+        }
+        if self.source_rate == self.target_rate {
+            return input.to_vec();
+        }
+
+        self.buffer.extend_from_slice(input);
+        let mut output = Vec::new();
+        loop {
+            let index = self.position.floor();
+            if !index.is_finite() || index < 0.0 {
+                break;
+            }
+            let index = index as usize;
+            let fraction = (self.position - index as f64) as f32;
+            let Some(&left) = self.buffer.get(index) else {
+                break;
+            };
+            let right = if fraction == 0.0 {
+                left
+            } else {
+                match self.buffer.get(index + 1) {
+                    Some(&sample) => sample,
+                    None => break,
+                }
+            };
+            output.push(left.mul_add(1.0 - fraction, right * fraction));
+            self.position += self.step;
+        }
+
+        let consumed = self.position.floor().max(0.0) as usize;
+        let drain = consumed.min(self.buffer.len().saturating_sub(1));
+        if drain > 0 {
+            self.buffer.drain(..drain);
+            self.position -= drain as f64;
+        }
+        output
+    }
 }
 
 #[allow(clippy::cast_precision_loss)]
@@ -535,6 +693,35 @@ mod tests {
         assert_eq!(output.len(), 8);
         assert!(output[0].abs() < f32::EPSILON);
         assert!((output[2] - 0.5).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn streaming_resampler_matches_concatenated_input_across_chunk_boundaries() {
+        let input: Vec<f32> = (0..64).map(|index| index as f32 / 63.0).collect();
+        let mut whole = LinearResampler::new(48_000, 44_100);
+        let expected = whole.push(&input);
+
+        let mut streaming = LinearResampler::new(48_000, 44_100);
+        let mut actual = streaming.push(&input[..13]);
+        actual.extend(streaming.push(&input[13..41]));
+        actual.extend(streaming.push(&input[41..]));
+
+        assert_eq!(actual.len(), expected.len());
+        for (left, right) in actual.iter().zip(expected.iter()) {
+            assert!((left - right).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn waveform_trace_is_bounded_and_keeps_chronological_order() {
+        let trace = WaveformTrace::new(4);
+        for value in 0..10 {
+            #[allow(clippy::cast_precision_loss)]
+            trace.push(value as f32);
+        }
+        assert_eq!(trace.snapshot(), vec![6.0, 7.0, 8.0, 9.0]);
+        assert_eq!(trace.snapshot().len(), 4);
     }
 
     #[test]
