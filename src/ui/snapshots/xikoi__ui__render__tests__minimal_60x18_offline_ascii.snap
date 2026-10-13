@@ -3,7 +3,7 @@ source: src/ui/render.rs
 expression: "rendered(60, 18, |view|\n{\n    view.theme = ThemeOptions::new(ColorMode::Mono).with_ascii(true);\n    view.link = LinkState::Offline; view.activity = ActivityState::Failed;\n    view.status_message = Some(\"OLLAMA OFFLINE\");\n})"
 ---
 x LINK OFFLINE  //  x ACTIVITY ERROR  //  OLLAMA OFFLINE    
-+ TRANSCRIPT // LOCAL CONTEXT -----------------------------+
++ TRANSCRIPT // CHAT:LOOPBACK  VOICE:LOOPBACK -------------+
 || let f = |x| x + 1;                                      |
 |                                                          |
 |A lambda can be represented by a closure.                 |

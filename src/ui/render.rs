@@ -10,12 +10,14 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Sparkline,
     },
 };
+use url::Url;
 
 use crate::{audio::AudioDirection, domain::ChatMessage};
 
 use super::{
     ActivityState, AudioChoice, HelpBinding, InteractionMode, ModelChoice, OverlayView,
-    SessionChoice, TelemetryView, Theme, UiView, VoiceState, markdown::message_lines, render_scope,
+    RouteLocation, SessionChoice, TelemetryView, Theme, ThemeOptions, TranscriptAnchor,
+    TranscriptScroll, UiView, VoiceState, markdown::message_lines, render_scope,
     sanitize_terminal_text, wrap_lines,
 };
 
@@ -67,7 +69,7 @@ pub fn render(frame: &mut Frame<'_>, view: &UiView<'_, '_>) {
     }
 
     if let Some(overlay) = view.overlay {
-        render_overlay(frame, area, overlay, view.telemetry, view.activity, theme);
+        render_overlay(frame, area, overlay, &view.telemetry, view.activity, theme);
     }
 }
 
@@ -90,10 +92,12 @@ fn render_wide(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, theme: 
         transcript,
         view.messages,
         view.transcript_scroll,
+        view.telemetry.chat_route,
+        view.telemetry.speech_route,
         theme,
     );
     render_input(frame, input, view, theme, true);
-    render_telemetry_panel(frame, telemetry, view.telemetry, view.activity, theme);
+    render_telemetry_panel(frame, telemetry, &view.telemetry, view.activity, theme);
     render_footer(frame, footer, view, theme, LayoutClass::Wide);
 }
 
@@ -112,6 +116,8 @@ fn render_compact(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, them
         transcript,
         view.messages,
         view.transcript_scroll,
+        view.telemetry.chat_route,
+        view.telemetry.speech_route,
         theme,
     );
     render_input(frame, input, view, theme, true);
@@ -133,6 +139,8 @@ fn render_minimal(frame: &mut Frame<'_>, area: Rect, view: &UiView<'_, '_>, them
         transcript,
         view.messages,
         view.transcript_scroll,
+        view.telemetry.chat_route,
+        view.telemetry.speech_route,
         theme,
     );
     render_input(frame, input, view, theme, false);
@@ -303,13 +311,22 @@ fn render_transcript(
     frame: &mut Frame<'_>,
     area: Rect,
     messages: &[ChatMessage],
-    scroll: super::TranscriptScroll,
+    scroll: TranscriptScroll,
+    chat_route: RouteLocation,
+    speech_route: RouteLocation,
     theme: Theme,
 ) {
     if area.is_empty() {
         return;
     }
-    let block = panel_block(" TRANSCRIPT // LOCAL CONTEXT ", theme);
+    let title = Line::from(vec![
+        Span::styled(" TRANSCRIPT // CHAT:", theme.muted),
+        Span::styled(chat_route.label(), route_style(chat_route, theme)),
+        Span::styled("  VOICE:", theme.muted),
+        Span::styled(speech_route.label(), route_style(speech_route, theme)),
+        Span::raw(" "),
+    ]);
+    let block = panel_block(title, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.is_empty() {
@@ -330,18 +347,10 @@ fn render_transcript(
         return;
     }
 
-    let raw_lines = if messages.is_empty() {
-        empty_transcript(theme)
-    } else {
-        messages
-            .iter()
-            .flat_map(|message| message_lines(message, theme))
-            .collect()
-    };
-    let wrapped = wrap_lines(raw_lines, content_area.width);
+    let (wrapped, anchors) = wrapped_transcript(messages, content_area.width, theme);
     let content_rows = wrapped.len();
     let viewport_rows = usize::from(content_area.height);
-    let offset = scroll.resolved(content_rows, viewport_rows);
+    let offset = resolve_transcript_scroll(scroll, &anchors, viewport_rows);
     let visible = wrapped
         .into_iter()
         .skip(offset)
@@ -377,6 +386,145 @@ fn render_transcript(
             &mut state,
         );
     }
+}
+
+/// Move the transcript by one page while retaining the identity of its top
+/// message row as the transcript grows or the terminal reflows.
+pub fn page_transcript(
+    messages: &[ChatMessage],
+    scroll: TranscriptScroll,
+    screen: Size,
+    options: ThemeOptions,
+    up: bool,
+    page_rows: usize,
+) -> TranscriptScroll {
+    let Some((content_width, viewport_rows)) = transcript_content_size(screen) else {
+        return scroll;
+    };
+    let theme = Theme::new(options);
+    let (_, anchors) = wrapped_transcript(messages, content_width, theme);
+    let content_rows = anchors.len();
+    let viewport_rows = usize::from(viewport_rows);
+    let maximum = content_rows.saturating_sub(viewport_rows);
+    let current = resolve_transcript_scroll(scroll, &anchors, viewport_rows);
+    let target = if up {
+        current.saturating_sub(page_rows)
+    } else {
+        current.saturating_add(page_rows).min(maximum)
+    };
+    if target >= maximum {
+        return TranscriptScroll::following_tail();
+    }
+    TranscriptScroll {
+        offset_from_tail: maximum.saturating_sub(target),
+        follow_tail: false,
+        anchor: anchors.get(target).copied().flatten(),
+    }
+}
+
+fn wrapped_transcript(
+    messages: &[ChatMessage],
+    width: u16,
+    theme: Theme,
+) -> (Vec<Line<'static>>, Vec<Option<TranscriptAnchor>>) {
+    if messages.is_empty() {
+        let lines = wrap_lines(empty_transcript(theme), width);
+        let anchors = vec![None; lines.len()];
+        return (lines, anchors);
+    }
+
+    let mut wrapped = Vec::new();
+    let mut anchors = Vec::new();
+    for message in messages {
+        let message_lines = wrap_lines(message_lines(message, theme), width);
+        anchors.extend((0..message_lines.len()).map(|row_in_message| {
+            Some(TranscriptAnchor {
+                message_id: message.id,
+                row_in_message,
+            })
+        }));
+        wrapped.extend(message_lines);
+    }
+    (wrapped, anchors)
+}
+
+fn resolve_transcript_scroll(
+    scroll: TranscriptScroll,
+    anchors: &[Option<TranscriptAnchor>],
+    viewport_rows: usize,
+) -> usize {
+    if scroll.follow_tail {
+        return anchors.len().saturating_sub(viewport_rows);
+    }
+    if let Some(anchor) = scroll.anchor
+        && let Some(position) = anchors
+            .iter()
+            .position(|row| row.is_some_and(|row| row == anchor))
+    {
+        return position;
+    }
+    if let Some(anchor) = scroll.anchor
+        && let Some((position, _)) = anchors
+            .iter()
+            .enumerate()
+            .filter_map(|(position, row)| {
+                row.as_ref()
+                    .filter(|row| row.message_id == anchor.message_id)
+                    .map(|row| (position, *row))
+            })
+            .min_by_key(|(_, row)| row.row_in_message.abs_diff(anchor.row_in_message))
+    {
+        return position;
+    }
+    anchors
+        .len()
+        .saturating_sub(viewport_rows)
+        .saturating_sub(scroll.offset_from_tail)
+}
+
+fn transcript_content_size(screen: Size) -> Option<(u16, u16)> {
+    let area = Rect::new(0, 0, screen.width, screen.height);
+    let transcript = match layout_class(screen) {
+        LayoutClass::Wide => {
+            let canvas = inset_horizontally(area, 1);
+            let [_, transcript, _, _] = Layout::vertical([
+                Constraint::Length(8),
+                Constraint::Fill(1),
+                Constraint::Length(10),
+                Constraint::Length(1),
+            ])
+            .areas(canvas);
+            transcript
+        }
+        LayoutClass::Compact => {
+            let [_, transcript, _, _] = Layout::vertical([
+                Constraint::Length(3),
+                Constraint::Fill(1),
+                Constraint::Length(6),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            transcript
+        }
+        LayoutClass::Minimal => {
+            let [_, transcript, _, _] = Layout::vertical([
+                Constraint::Length(1),
+                Constraint::Fill(1),
+                Constraint::Length(4),
+                Constraint::Length(1),
+            ])
+            .areas(area);
+            transcript
+        }
+        LayoutClass::TooSmall => return None,
+    };
+    let inner_width = transcript.width.saturating_sub(2);
+    let content_width = if inner_width > 1 {
+        inner_width.saturating_sub(1)
+    } else {
+        inner_width
+    };
+    Some((content_width, transcript.height.saturating_sub(2)))
 }
 
 fn render_input(
@@ -547,7 +695,7 @@ fn render_input_signal(frame: &mut Frame<'_>, area: Rect, samples: &[u64], theme
 fn render_telemetry_panel(
     frame: &mut Frame<'_>,
     area: Rect,
-    telemetry: TelemetryView<'_>,
+    telemetry: &TelemetryView<'_>,
     activity: ActivityState,
     theme: Theme,
 ) {
@@ -571,7 +719,7 @@ fn render_telemetry_panel(
 fn render_context_gauge(
     frame: &mut Frame<'_>,
     area: Rect,
-    telemetry: TelemetryView<'_>,
+    telemetry: &TelemetryView<'_>,
     activity: ActivityState,
     theme: Theme,
 ) {
@@ -621,8 +769,8 @@ fn render_footer(
     let pending = metrics_pending(view.activity);
     let tokens = token_metric(telemetry.generated_tokens, view.activity);
     let token_style = if pending { theme.secondary } else { theme.text };
-    let context = context_status(telemetry, view.activity);
-    let context_style = if context_is_high(telemetry, view.activity) {
+    let context = context_status(&telemetry, view.activity);
+    let context_style = if context_is_high(&telemetry, view.activity) {
         theme.warning
     } else if pending {
         theme.secondary
@@ -700,7 +848,7 @@ fn render_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
     overlay: OverlayView<'_>,
-    telemetry: TelemetryView<'_>,
+    telemetry: &TelemetryView<'_>,
     activity: ActivityState,
     theme: Theme,
 ) {
@@ -798,28 +946,35 @@ fn render_model_overlay(
         Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(area);
     if items.is_empty() {
         frame.render_widget(
-            Paragraph::new("No installed models. For Ollama: ollama pull <model>; then Ctrl+R.")
-                .style(theme.warning)
-                .alignment(Alignment::Center),
+            Paragraph::new(
+                "No models available. Load one in the configured chat backend, then Ctrl+R.",
+            )
+            .style(theme.warning)
+            .alignment(Alignment::Center),
             list_area,
         );
     } else {
         let rows = items.iter().map(|item| {
-            let location = if item.is_cloud { "CLOUD" } else { "LOCAL" };
-            let location_style = if item.is_cloud {
-                theme.warning
-            } else {
-                theme.accent
-            };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("[{location:<5}] "), location_style),
-                Span::styled(item.name.to_owned(), theme.text),
+            let unsupported = item.chat_support == Some(false);
+            let mut spans = vec![
+                Span::styled(
+                    format!("[{}] ", item.route.label()),
+                    route_style(item.route, theme),
+                ),
+                Span::styled(
+                    item.name.to_owned(),
+                    if unsupported { theme.muted } else { theme.text },
+                ),
                 Span::styled(
                     item.detail
                         .map_or_else(String::new, |detail| format!("  {detail}")),
                     theme.muted,
                 ),
-            ]))
+            ];
+            if unsupported {
+                spans.push(Span::styled("  CHAT UNSUPPORTED", theme.warning));
+            }
+            ListItem::new(Line::from(spans))
         });
         let list = List::new(rows)
             .highlight_style(theme.selected)
@@ -908,7 +1063,7 @@ fn render_help_overlay(
 fn render_inspector(
     frame: &mut Frame<'_>,
     area: Rect,
-    telemetry: TelemetryView<'_>,
+    telemetry: &TelemetryView<'_>,
     activity: ActivityState,
     theme: Theme,
 ) {
@@ -938,14 +1093,29 @@ fn panel_block<'a>(title: impl Into<Line<'a>>, theme: Theme) -> Block<'a> {
         .title(title)
 }
 
+fn route_style(route: RouteLocation, theme: Theme) -> ratatui::style::Style {
+    match route {
+        RouteLocation::Loopback => theme.accent,
+        RouteLocation::Disabled => theme.muted,
+        RouteLocation::Network | RouteLocation::Cloud | RouteLocation::Unknown => theme.warning,
+    }
+}
+
+fn redact_endpoint(endpoint: &str) -> String {
+    if let Ok(url) = Url::parse(endpoint) {
+        return crate::config::redact_endpoint(&url);
+    }
+    sanitize_terminal_text(endpoint)
+}
+
 fn empty_transcript(theme: Theme) -> Vec<Line<'static>> {
     vec![
         Line::default(),
         Line::from(vec![Span::styled(
             if theme.ascii {
-                "XIKOI // LOCAL NEURAL CHANNEL"
+                "XIKOI // SESSION CHANNEL"
             } else {
-                "XIKOI // LOCAL NEURAL CHANNEL ◇"
+                "XIKOI // SESSION CHANNEL ◇"
             },
             theme.accent,
         )])
@@ -960,7 +1130,7 @@ fn empty_transcript(theme: Theme) -> Vec<Line<'static>> {
 }
 
 fn telemetry_summary_lines(
-    telemetry: TelemetryView<'_>,
+    telemetry: &TelemetryView<'_>,
     activity: ActivityState,
     theme: Theme,
 ) -> Vec<Line<'static>> {
@@ -1031,15 +1201,16 @@ fn telemetry_summary_lines(
 }
 
 fn telemetry_detail_lines(
-    telemetry: TelemetryView<'_>,
+    telemetry: &TelemetryView<'_>,
     activity: ActivityState,
     theme: Theme,
 ) -> Vec<Line<'static>> {
-    let endpoint = nonempty_or(telemetry.endpoint, "--");
+    let endpoint = redact_endpoint(nonempty_or(telemetry.endpoint, "--"));
     let elapsed = telemetry
         .elapsed_ms
         .map_or_else(|| "--".to_owned(), format_millis);
     let backend = telemetry.backend_version.unwrap_or("--");
+    let backend_name = nonempty_or(telemetry.backend_name, "BACKEND");
     let session = telemetry.session.unwrap_or("--");
     let allocated_context = optional_u64(telemetry.context_limit);
     let maximum_context = optional_u64(telemetry.maximum_context);
@@ -1087,8 +1258,26 @@ fn telemetry_detail_lines(
             theme.text,
             theme,
         ),
-        metric_line("OLLAMA", backend, theme.text, theme),
-        metric_line("ENDPOINT", endpoint, theme.secondary, theme),
+        metric_line(backend_name, backend, theme.text, theme),
+        metric_line(
+            "SESSION BACKEND",
+            telemetry.session_backend,
+            theme.text,
+            theme,
+        ),
+        metric_line(
+            "CHAT ROUTE",
+            telemetry.chat_route.label(),
+            route_style(telemetry.chat_route, theme),
+            theme,
+        ),
+        metric_line(
+            "SPEECH ROUTE",
+            telemetry.speech_route.label(),
+            route_style(telemetry.speech_route, theme),
+            theme,
+        ),
+        metric_line("ENDPOINT", &endpoint, theme.secondary, theme),
         metric_line("SESSION", session, theme.text, theme),
         metric_line("ALLOC CONTEXT", &allocated_context, theme.text, theme),
         metric_line("MAX CONTEXT", &maximum_context, theme.text, theme),
@@ -1213,7 +1402,7 @@ fn token_metric(value: Option<u64>, activity: ActivityState) -> String {
     final_metric(activity, || optional_u64(value))
 }
 
-fn context_is_high(telemetry: TelemetryView<'_>, activity: ActivityState) -> bool {
+fn context_is_high(telemetry: &TelemetryView<'_>, activity: ActivityState) -> bool {
     !metrics_pending(activity)
         && !metrics_unavailable(activity)
         && telemetry
@@ -1221,7 +1410,7 @@ fn context_is_high(telemetry: TelemetryView<'_>, activity: ActivityState) -> boo
             .is_some_and(|ratio| ratio >= CONTEXT_WARNING_RATIO)
 }
 
-fn context_gauge_label(telemetry: TelemetryView<'_>, activity: ActivityState) -> String {
+fn context_gauge_label(telemetry: &TelemetryView<'_>, activity: ActivityState) -> String {
     if metrics_pending(activity) {
         return telemetry.context_limit.map_or_else(
             || "CTX PENDING".to_owned(),
@@ -1258,7 +1447,7 @@ fn context_gauge_label(telemetry: TelemetryView<'_>, activity: ActivityState) ->
     }
 }
 
-fn context_status(telemetry: TelemetryView<'_>, activity: ActivityState) -> String {
+fn context_status(telemetry: &TelemetryView<'_>, activity: ActivityState) -> String {
     if metrics_pending(activity) {
         return telemetry
             .context_limit
@@ -1348,6 +1537,21 @@ mod tests {
     };
 
     use super::*;
+
+    static MODELS: [ModelChoice<'static>; 2] = [
+        ModelChoice {
+            name: "qwen3.5:9b",
+            detail: Some("9B Q4_K_M"),
+            chat_support: Some(true),
+            route: RouteLocation::Loopback,
+        },
+        ModelChoice {
+            name: "remote-reasoner",
+            detail: Some("cloud"),
+            chat_support: Some(true),
+            route: RouteLocation::Cloud,
+        },
+    ];
 
     #[test]
     fn breakpoints_are_exact_on_both_axes() {
@@ -1459,6 +1663,7 @@ mod tests {
             view.transcript_scroll = TranscriptScroll {
                 offset_from_tail: 2,
                 follow_tail: false,
+                anchor: None,
             };
         });
         assert!(output.contains("TRANSCRIPT"));
@@ -1586,18 +1791,6 @@ mod tests {
 
     #[test]
     fn all_overlay_states_render_on_the_compact_layout() {
-        static MODELS: [ModelChoice<'static>; 2] = [
-            ModelChoice {
-                name: "qwen3.5:9b",
-                detail: Some("9B Q4_K_M"),
-                is_cloud: false,
-            },
-            ModelChoice {
-                name: "remote-reasoner",
-                detail: Some("cloud"),
-                is_cloud: true,
-            },
-        ];
         static SESSIONS: [SessionChoice<'static>; 1] = [SessionChoice {
             id: "019fb1d4-6e31-7d63",
             title: "Rust planning",
@@ -1656,8 +1849,8 @@ mod tests {
                 query: None,
             });
         });
-        assert!(no_models_output.contains("No installed models"));
-        assert!(no_models_output.contains("ollama pull"));
+        assert!(no_models_output.contains("No models available"));
+        assert!(no_models_output.contains("configured chat backend"));
 
         let sessions_output = rendered(90, 28, |view| {
             view.overlay = Some(OverlayView::Sessions {
@@ -1817,7 +2010,11 @@ mod tests {
         let telemetry = TelemetryView {
             model: "qwen3.5:9b",
             model_detail: Some("9B Q4_K_M"),
+            backend_name: "OLLAMA",
+            session_backend: "OLLAMA",
             endpoint: "http://127.0.0.1:11434",
+            chat_route: super::super::RouteLocation::Loopback,
+            speech_route: super::super::RouteLocation::Loopback,
             backend_version: Some("0.11.10"),
             session: Some("019fb1d4-6e31-7d63"),
             context_used: Some(1_024),

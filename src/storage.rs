@@ -13,7 +13,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    config::{AppPaths, AppStateFile},
+    config::{AppPaths, AppStateFile, BackendKind},
     domain::{ChatMessage, Role},
 };
 
@@ -41,6 +41,7 @@ pub enum SessionRecord {
 pub struct LoadedSession {
     pub id: Uuid,
     pub created_at: DateTime<Utc>,
+    pub backend: String,
     pub messages: Vec<ChatMessage>,
     pub path: PathBuf,
     pub recovered_from: Option<Uuid>,
@@ -84,12 +85,29 @@ impl Storage {
     }
 
     pub async fn create_session(&self) -> Result<LoadedSession, StorageError> {
-        self.create_session_recovered_from(None).await
+        self.create_session_with_backend(BackendKind::Ollama).await
+    }
+
+    pub async fn create_session_with_backend(
+        &self,
+        backend: BackendKind,
+    ) -> Result<LoadedSession, StorageError> {
+        self.create_session_record(None, backend.storage_name().to_owned())
+            .await
     }
 
     async fn create_session_recovered_from(
         &self,
         recovered_from: Option<Uuid>,
+        backend: String,
+    ) -> Result<LoadedSession, StorageError> {
+        self.create_session_record(recovered_from, backend).await
+    }
+
+    async fn create_session_record(
+        &self,
+        recovered_from: Option<Uuid>,
+        backend: String,
     ) -> Result<LoadedSession, StorageError> {
         let id = Uuid::now_v7();
         let created_at = Utc::now();
@@ -98,13 +116,14 @@ impl Storage {
             schema_version: SESSION_SCHEMA_VERSION,
             id,
             created_at,
-            backend: "ollama".to_owned(),
+            backend: backend.clone(),
             recovered_from,
         };
         create_record_file(&path, &record).await?;
         Ok(LoadedSession {
             id,
             created_at,
+            backend,
             messages: Vec::new(),
             path,
             recovered_from,
@@ -135,7 +154,9 @@ impl Storage {
     }
 
     async fn recover_session(&self, source: LoadedSession) -> Result<LoadedSession, StorageError> {
-        let mut recovered = self.create_session_recovered_from(Some(source.id)).await?;
+        let mut recovered = self
+            .create_session_recovered_from(Some(source.id), source.backend.clone())
+            .await?;
         for message in &source.messages {
             self.append_message(recovered.id, message).await?;
         }
@@ -215,6 +236,7 @@ async fn parse_session_file(path: &Path) -> Result<ParsedSession, StorageError> 
     let mut id = None;
     let mut created_at = None;
     let mut recovered_from = None;
+    let mut backend = None;
     let mut messages = Vec::new();
     let mut corrupt = false;
 
@@ -238,7 +260,7 @@ async fn parse_session_file(path: &Path) -> Result<ParsedSession, StorageError> 
                 schema_version,
                 id: session_id,
                 created_at: session_created_at,
-                backend: _,
+                backend: session_backend,
                 recovered_from: source,
             } => {
                 validate_schema(schema_version)?;
@@ -248,6 +270,7 @@ async fn parse_session_file(path: &Path) -> Result<ParsedSession, StorageError> 
                 }
                 id = Some(session_id);
                 created_at = Some(session_created_at);
+                backend = Some(session_backend);
                 recovered_from = source;
             }
             SessionRecord::Message {
@@ -273,6 +296,7 @@ async fn parse_session_file(path: &Path) -> Result<ParsedSession, StorageError> 
         session: LoadedSession {
             id,
             created_at,
+            backend: backend.ok_or_else(|| StorageError::InvalidSession(path.to_path_buf()))?,
             messages,
             path: path.to_path_buf(),
             recovered_from,

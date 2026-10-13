@@ -14,7 +14,7 @@ use ratatui_textarea::TextArea;
 use crate::{audio::AudioDirection, config::ColorMode, domain::ChatMessage};
 
 pub use markdown::{markdown_lines, message_lines, wrap_lines};
-pub use render::{LayoutClass, layout_class, render};
+pub use render::{LayoutClass, layout_class, page_transcript, render};
 pub use sanitize::sanitize_terminal_text;
 pub use scope::{ascii_waveform, render_dual_scopes, render_scope, scope_trace};
 pub use theme::{ColorProfile, Theme, ThemeOptions};
@@ -66,6 +66,32 @@ pub enum InteractionMode {
     #[default]
     Typing,
     Voice,
+}
+
+/// Where requests are sent according to the configured endpoint/model.
+///
+/// `Loopback` describes the URL Xikoi calls; a local proxy may still forward
+/// requests elsewhere.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RouteLocation {
+    Loopback,
+    Network,
+    Cloud,
+    #[default]
+    Unknown,
+    Disabled,
+}
+
+impl RouteLocation {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Loopback => "LOOPBACK",
+            Self::Network => "NETWORK",
+            Self::Cloud => "CLOUD",
+            Self::Unknown => "UNKNOWN",
+            Self::Disabled => "OFF",
+        }
+    }
 }
 
 impl InteractionMode {
@@ -130,16 +156,23 @@ impl Default for VoiceView<'_> {
     }
 }
 
+/// Stable identity for the row at the top of a detached transcript viewport.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TranscriptAnchor {
+    pub message_id: uuid::Uuid,
+    pub row_in_message: usize,
+}
+
 /// Scroll state for the transcript.
 ///
-/// `offset_from_tail` is measured in rendered rows above the newest viewport.
-/// This lets the app implement `PageUp` by incrementing and `PageDown` by
-/// decrementing without knowing the current wrapped transcript height.  When
-/// `follow_tail` is set, the renderer ignores the offset and pins to newest.
+/// Detached views resolve `anchor` against each message's rendered rows, so
+/// newly appended messages do not move the reading position. The tail offset
+/// remains a fallback for empty transcripts and older callers.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TranscriptScroll {
     pub offset_from_tail: usize,
     pub follow_tail: bool,
+    pub anchor: Option<TranscriptAnchor>,
 }
 
 impl TranscriptScroll {
@@ -147,6 +180,7 @@ impl TranscriptScroll {
         Self {
             offset_from_tail: 0,
             follow_tail: true,
+            anchor: None,
         }
     }
 
@@ -165,7 +199,11 @@ impl TranscriptScroll {
 pub struct TelemetryView<'a> {
     pub model: &'a str,
     pub model_detail: Option<&'a str>,
+    pub backend_name: &'a str,
+    pub session_backend: &'a str,
     pub endpoint: &'a str,
+    pub chat_route: RouteLocation,
+    pub speech_route: RouteLocation,
     pub backend_version: Option<&'a str>,
     pub session: Option<&'a str>,
     pub context_used: Option<u64>,
@@ -203,7 +241,8 @@ impl TelemetryView<'_> {
 pub struct ModelChoice<'a> {
     pub name: &'a str,
     pub detail: Option<&'a str>,
-    pub is_cloud: bool,
+    pub chat_support: Option<bool>,
+    pub route: RouteLocation,
 }
 
 /// A session row supplied to the session-picker overlay.
@@ -318,12 +357,14 @@ mod tests {
         let detached = TranscriptScroll {
             offset_from_tail: 10,
             follow_tail: false,
+            anchor: None,
         };
         assert_eq!(detached.resolved(100, 20), 70);
 
         let beyond_oldest = TranscriptScroll {
             offset_from_tail: 500,
             follow_tail: false,
+            anchor: None,
         };
         assert_eq!(beyond_oldest.resolved(100, 20), 0);
 

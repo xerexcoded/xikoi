@@ -242,7 +242,11 @@ async fn check_voice(config: &RuntimeConfig) -> bool {
             .await
         {
             Ok(_guard) => {
-                report("speech server", true, config.speech.url.as_str());
+                report(
+                    "speech server",
+                    true,
+                    &crate::config::redact_endpoint(&config.speech.url),
+                );
             }
             Err(error) => healthy &= report("speech server", false, &error.to_string()),
         }

@@ -3,6 +3,21 @@
 All notable Xikoi changes are recorded here. Releases follow semantic
 versioning.
 
+## 0.1.2 - 2026-10-13
+
+- Bind asynchronous voice work to its session and cancel it when sessions or models
+  change.
+- Preserve hydrated model capabilities, gate embedding-only models, discard stale
+  hydration responses, and surface streamed llama.cpp errors with cancellable
+  delivery.
+- Bound and cancel reads of backend and speech error responses.
+- Show configured chat and speech routes, redact endpoint secrets, and document
+  MLX-Audio's temporary audio files.
+- Handle Ctrl+C in overlays, initialize bracketed paste with terminal cleanup, and
+  keep detached transcript reading anchored during streaming.
+- Save and load the backend associated with each session and report backend or
+  model mismatches.
+
 ## 0.1.1 - 2026-08-13
 
 - Render dual scope-tui oscilloscopes for live microphone and synthesized-speaker PCM.

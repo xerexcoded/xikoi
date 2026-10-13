@@ -33,6 +33,25 @@ pub enum BackendKind {
     LlamaCpp,
 }
 
+impl BackendKind {
+    pub const fn storage_name(self) -> &'static str {
+        match self {
+            Self::Ollama => "ollama",
+            Self::LlamaCpp => "llama_cpp",
+        }
+    }
+}
+
+/// Return a display-safe endpoint without credentials or URL parameters.
+pub fn redact_endpoint(url: &Url) -> String {
+    let mut redacted = url.clone();
+    let _ = redacted.set_username("");
+    let _ = redacted.set_password(None);
+    redacted.set_query(None);
+    redacted.set_fragment(None);
+    redacted.to_string()
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "xikoi",
@@ -71,7 +90,7 @@ pub struct Cli {
     #[arg(long)]
     pub no_animation: bool,
 
-    /// MLX-Audio base URL.
+    /// MLX-Audio base URL. A remote endpoint receives recorded audio and speech requests.
     #[arg(long, global = true)]
     pub speech_url: Option<Url>,
 
@@ -121,6 +140,7 @@ pub struct SetupArgs {
 #[serde(default, deny_unknown_fields)]
 pub struct FileSpeechConfig {
     pub enabled: Option<bool>,
+    /// MLX-Audio destination; remote URLs receive captured audio and generated speech text.
     pub url: Option<Url>,
     pub asr_model: Option<String>,
     pub tts_model: Option<String>,

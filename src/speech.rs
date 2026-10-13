@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::http_limits::{
-    LimitedBodyError, MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES, read_limited_body,
+    CancellableBodyError, LimitedBodyError, MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES,
+    read_limited_body, read_limited_body_cancellable,
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(30);
@@ -69,7 +70,7 @@ impl MlxAudioClient {
         let client = Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
-            .map_err(SpeechFailure::Transport)?;
+            .map_err(safe_transport)?;
         Ok(Self { client, base_url })
     }
 
@@ -81,10 +82,10 @@ impl MlxAudioClient {
             .timeout(Duration::from_secs(2))
             .send()
             .await
-            .map_err(SpeechFailure::Transport)?;
+            .map_err(safe_transport)?;
         ensure_success(response).await?;
         Ok(SpeechServerInfo {
-            endpoint: self.base_url.to_string(),
+            endpoint: crate::config::redact_endpoint(&self.base_url),
         })
     }
 
@@ -100,7 +101,7 @@ impl MlxAudioClient {
         let audio = multipart::Part::bytes(request.wav)
             .file_name("xikoi-capture.wav")
             .mime_str("audio/wav")
-            .map_err(SpeechFailure::Transport)?;
+            .map_err(safe_transport)?;
         let mut form = multipart::Form::new()
             .text("model", request.model)
             .text("response_format", "json")
@@ -117,18 +118,23 @@ impl MlxAudioClient {
             .send();
         let response = tokio::select! {
             () = cancellation.cancelled() => return Err(SpeechFailure::Cancelled),
-            response = dispatch => response.map_err(SpeechFailure::Transport)?,
+            response = dispatch => response.map_err(safe_transport)?,
         };
         if cancellation.is_cancelled() {
             return Err(SpeechFailure::Cancelled);
         }
-        let response = ensure_success(response).await?;
+        let response = ensure_success_cancellable(response, cancellation).await?;
         if cancellation.is_cancelled() {
             return Err(SpeechFailure::Cancelled);
         }
-        let body = read_limited_body(response, MAX_JSON_BODY_BYTES)
-            .await
-            .map_err(speech_body_failure)?;
+        let body = read_limited_body_cancellable(
+            response,
+            MAX_JSON_BODY_BYTES,
+            cancellation,
+            REQUEST_TIMEOUT,
+        )
+        .await
+        .map_err(speech_cancellable_body_failure)?;
         if cancellation.is_cancelled() {
             return Err(SpeechFailure::Cancelled);
         }
@@ -159,9 +165,9 @@ impl MlxAudioClient {
             .send();
         let response = tokio::select! {
             () = cancellation.cancelled() => return Err(SpeechFailure::Cancelled),
-            response = dispatch => response.map_err(SpeechFailure::Transport)?,
+            response = dispatch => response.map_err(safe_transport)?,
         };
-        ensure_success(response).await
+        ensure_success_cancellable(response, cancellation).await
     }
 
     fn endpoint(&self, path: &str) -> Result<Url, SpeechFailure> {
@@ -185,12 +191,49 @@ async fn ensure_success(response: Response) -> Result<Response, SpeechFailure> {
     })
 }
 
+async fn ensure_success_cancellable(
+    response: Response,
+    cancellation: &CancellationToken,
+) -> Result<Response, SpeechFailure> {
+    if cancellation.is_cancelled() {
+        return Err(SpeechFailure::Cancelled);
+    }
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let body = read_limited_body_cancellable(
+        response,
+        MAX_ERROR_BODY_BYTES,
+        cancellation,
+        REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(speech_cancellable_body_failure)?;
+    Err(SpeechFailure::Server {
+        status,
+        message: bounded_body(&body),
+    })
+}
+
 fn speech_body_failure(error: LimitedBodyError) -> SpeechFailure {
     match error {
         LimitedBodyError::TooLarge { limit } => SpeechFailure::Protocol(format!(
             "MLX-Audio returned a response larger than {limit} bytes"
         )),
-        LimitedBodyError::Transport(error) => SpeechFailure::Transport(error),
+        LimitedBodyError::Transport(error) => safe_transport(error),
+    }
+}
+
+fn safe_transport(error: reqwest::Error) -> SpeechFailure {
+    SpeechFailure::Transport(error.without_url())
+}
+
+fn speech_cancellable_body_failure(error: CancellableBodyError) -> SpeechFailure {
+    match error {
+        CancellableBodyError::Cancelled => SpeechFailure::Cancelled,
+        CancellableBodyError::TimedOut => SpeechFailure::Timeout,
+        CancellableBodyError::Body(error) => speech_body_failure(error),
     }
 }
 
@@ -214,6 +257,8 @@ pub enum SpeechFailure {
     Cancelled,
     #[error("could not reach MLX-Audio: {0}")]
     Transport(#[source] reqwest::Error),
+    #[error("MLX-Audio response body timed out")]
+    Timeout,
     #[error("MLX-Audio protocol error: {0}")]
     Protocol(String),
     #[error("MLX-Audio returned HTTP {status}: {message}")]

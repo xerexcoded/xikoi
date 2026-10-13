@@ -7,7 +7,7 @@ use std::{
 use color_eyre::eyre::{Result, WrapErr};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use futures_util::StreamExt;
-use ratatui::DefaultTerminal;
+use ratatui::{DefaultTerminal, layout::Size};
 use ratatui_textarea::{Input, Key, TextArea};
 use tokio::{
     sync::mpsc,
@@ -26,7 +26,7 @@ use crate::{
     config::{AppStateFile, BackendKind, RuntimeConfig},
     domain::{
         BackendFailure, BackendInfo, ChatEvent, ChatMessage, ChatRequest, GenerationOptions,
-        MessageOrigin, MessageStatus, ModelSummary, SelectedModel, Usage,
+        MessageOrigin, MessageStatus, ModelDetails, ModelSummary, SelectedModel, Usage,
     },
     speech::{
         MlxAudioClient, SpeechFailure, SpeechServerInfo, SynthesisRequest, TranscriptionRequest,
@@ -34,8 +34,8 @@ use crate::{
     storage::{LoadedSession, SessionSummary, Storage},
     ui::{
         self, ActivityState, AudioChoice, HelpBinding, InteractionMode, LinkState, ModelChoice,
-        OverlayView, SessionChoice, TelemetryView, ThemeOptions, TranscriptScroll, UiView,
-        VoiceState, VoiceView,
+        OverlayView, RouteLocation, SessionChoice, TelemetryView, ThemeOptions, TranscriptScroll,
+        UiView, VoiceState, VoiceView,
     },
 };
 
@@ -73,20 +73,24 @@ enum InternalEvent {
     SpeechProbe(Result<SpeechServerInfo, String>),
     Transcription {
         operation_id: u64,
+        session_id: Uuid,
         result: Result<String, String>,
     },
     TtsChunk {
         operation_id: u64,
+        session_id: Uuid,
         bytes: Vec<u8>,
     },
     TtsFinished {
         operation_id: u64,
+        session_id: Uuid,
         result: Result<(), String>,
     },
 }
 
 struct ModelHydration {
     name: String,
+    request_id: u64,
     result: Result<SelectedModel, BackendFailure>,
     running: Result<Vec<SelectedModel>, BackendFailure>,
 }
@@ -102,6 +106,8 @@ pub struct App {
     session: LoadedSession,
     sessions: Vec<SessionSummary>,
     models: Vec<ModelSummary>,
+    model_hydration_request_id: u64,
+    model_hydration_pending: bool,
     selected_model: Option<SelectedModel>,
     backend_info: Option<BackendInfo>,
     input: TextArea<'static>,
@@ -120,6 +126,7 @@ pub struct App {
     overlay: Option<Overlay>,
     overlay_index: usize,
     transcript_scroll: TranscriptScroll,
+    terminal_size: Size,
     signal_samples: VecDeque<u64>,
     input_signal_samples: VecDeque<u64>,
     user_scope_samples: Vec<f32>,
@@ -147,34 +154,8 @@ impl App {
     ) -> Result<Self> {
         let mut persisted = storage.load_state().await?;
         let sessions = storage.list_sessions().await?;
-        let requested_session = config
-            .resume
-            .as_deref()
-            .or(persisted.recent_session.as_deref())
-            .and_then(|value| Uuid::parse_str(value).ok());
-
-        let (session, initial_status) = if let Some(id) = requested_session {
-            match storage.load_session(id).await {
-                Ok(session) => {
-                    let status = session
-                        .had_interruption
-                        .then(|| "RECOVERED // previous turn was interrupted".to_owned());
-                    (session, status)
-                }
-                Err(error) => {
-                    warn!(%error, "could not resume requested chat; creating a new one");
-                    (
-                        storage.create_session().await?,
-                        Some("SESSION NOT FOUND // opened a new link".to_owned()),
-                    )
-                }
-            }
-        } else {
-            (storage.create_session().await?, None)
-        };
-
-        persisted.recent_session = Some(session.id.to_string());
-        storage.save_state(&persisted).await?;
+        let (session, initial_status) =
+            resolve_startup_session(&storage, &config, &mut persisted).await?;
         let (internal_tx, internal_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let speech = Arc::new(
             MlxAudioClient::new(config.speech.url.clone())
@@ -198,6 +179,8 @@ impl App {
             session,
             sessions,
             models: Vec::new(),
+            model_hydration_request_id: 0,
+            model_hydration_pending: false,
             selected_model: None,
             backend_info: None,
             input,
@@ -216,6 +199,7 @@ impl App {
             overlay: None,
             overlay_index: 0,
             transcript_scroll: TranscriptScroll::following_tail(),
+            terminal_size: Size::new(80, 24),
             signal_samples: VecDeque::from(vec![0; SIGNAL_CAPACITY]),
             input_signal_samples: VecDeque::from(vec![0; SIGNAL_CAPACITY]),
             user_scope_samples: Vec::new(),
@@ -240,6 +224,9 @@ impl App {
     }
 
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        self.terminal_size = terminal
+            .size()
+            .wrap_err("could not read terminal dimensions")?;
         let mut terminal_events = EventStream::new();
         let tick_rate = if self.config.animation || self.config.speech.enabled {
             Duration::from_micros(66_667)
@@ -311,7 +298,15 @@ impl App {
             .map(|(model, detail)| ModelChoice {
                 name: &model.name,
                 detail: (!detail.is_empty()).then_some(detail.as_str()),
-                is_cloud: model.is_cloud(),
+                chat_support: model_chat_support(&model.capabilities),
+                route: if model.is_cloud() {
+                    RouteLocation::Cloud
+                } else {
+                    endpoint_location(match self.config.backend {
+                        BackendKind::Ollama => &self.config.ollama_url,
+                        BackendKind::LlamaCpp => &self.config.llama_url,
+                    })
+                },
             })
             .collect();
 
@@ -477,7 +472,22 @@ impl App {
         TelemetryView {
             model: selected.map_or("UNSELECTED", |model| model.summary.name.as_str()),
             model_detail,
+            backend_name: backend_label(self.config.backend),
+            session_backend: stored_backend_label(&self.session.backend),
             endpoint,
+            chat_route: if selected.is_some_and(|model| model.summary.is_cloud()) {
+                RouteLocation::Cloud
+            } else {
+                endpoint_location(match self.config.backend {
+                    BackendKind::Ollama => &self.config.ollama_url,
+                    BackendKind::LlamaCpp => &self.config.llama_url,
+                })
+            },
+            speech_route: if self.config.speech.enabled {
+                endpoint_location(&self.config.speech.url)
+            } else {
+                RouteLocation::Disabled
+            },
             backend_version: self.backend_info.as_ref().map(|info| info.version.as_str()),
             session: Some(session_id),
             context_used: usage.and_then(|item| item.prompt_eval_count),
@@ -507,20 +517,26 @@ impl App {
                 self.pulse_input(12);
                 self.dirty = true;
             }
-            Event::Resize(_, _) => self.dirty = true,
+            Event::Resize(width, height) => {
+                self.terminal_size = Size::new(width, height);
+                self.dirty = true;
+            }
             _ => {}
         }
         Ok(())
     }
 
     async fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            return self.request_quit().await;
+        }
+
         if self.overlay.is_some() {
             return self.handle_overlay_key(key).await;
         }
 
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('c') => return self.request_quit().await,
                 KeyCode::Char('k') => {
                     self.open_models();
                     return Ok(());
@@ -558,21 +574,25 @@ impl App {
             KeyCode::Esc => self.cancel_active_work(),
             KeyCode::Char(' ') if self.voice_mode => self.handle_voice_trigger().await?,
             KeyCode::PageUp => {
-                self.transcript_scroll.follow_tail = false;
-                self.transcript_scroll.offset_from_tail = self
-                    .transcript_scroll
-                    .offset_from_tail
-                    .saturating_add(PAGE_ROWS);
+                self.transcript_scroll = ui::page_transcript(
+                    &self.session.messages,
+                    self.transcript_scroll,
+                    self.terminal_size,
+                    self.theme,
+                    true,
+                    PAGE_ROWS,
+                );
                 self.dirty = true;
             }
             KeyCode::PageDown => {
-                self.transcript_scroll.offset_from_tail = self
-                    .transcript_scroll
-                    .offset_from_tail
-                    .saturating_sub(PAGE_ROWS);
-                if self.transcript_scroll.offset_from_tail == 0 {
-                    self.transcript_scroll.follow_tail = true;
-                }
+                self.transcript_scroll = ui::page_transcript(
+                    &self.session.messages,
+                    self.transcript_scroll,
+                    self.terminal_size,
+                    self.theme,
+                    false,
+                    PAGE_ROWS,
+                );
                 self.dirty = true;
             }
             KeyCode::End => {
@@ -658,15 +678,14 @@ impl App {
                     StartupModelChoice::Select(index) => self.select_model(index).await?,
                     StartupModelChoice::RequestedUnavailable => {
                         self.status = Some(
-                            "REQUESTED MODEL UNAVAILABLE // select an installed local model"
+                            "REQUESTED MODEL UNAVAILABLE // select an installed chat model"
                                 .to_owned(),
                         );
                         self.open_overlay(Overlay::Models);
                     }
                     StartupModelChoice::NoModels => {
-                        self.status = Some(
-                            "NO LOCAL MODELS // load one in the configured chat backend".to_owned(),
-                        );
+                        self.status =
+                            Some("NO MODELS // load one in the configured chat backend".to_owned());
                     }
                     StartupModelChoice::Picker if self.selected_model.is_none() => {
                         self.open_models();
@@ -686,20 +705,27 @@ impl App {
             InternalEvent::ModelHydrated(hydration) => {
                 let ModelHydration {
                     name,
+                    request_id,
                     result,
                     running,
                 } = *hydration;
-                if self
-                    .selected_model
-                    .as_ref()
-                    .is_none_or(|selected| selected.summary.name != name)
+                if request_id != self.model_hydration_request_id
+                    || self
+                        .selected_model
+                        .as_ref()
+                        .is_none_or(|selected| selected.summary.name != name)
                 {
                     return Ok(());
                 }
+                let was_waiting_for_metadata = self
+                    .status
+                    .as_deref()
+                    .is_some_and(|status| status.starts_with("MODEL METADATA LOADING"));
+                self.model_hydration_pending = false;
                 match result {
                     Ok(mut detailed) => {
                         if let Some(summary) = self.models.iter().find(|model| model.name == name) {
-                            detailed.summary = summary.clone();
+                            merge_model_summary(&mut detailed.summary, summary);
                         }
                         if let Ok(running) = running
                             && let Some(loaded) =
@@ -710,6 +736,13 @@ impl App {
                             detailed.expires_at = loaded.expires_at;
                         }
                         self.selected_model = Some(detailed);
+                        if let Some(model) = self.selected_model.as_ref().filter(|model| {
+                            model_chat_support(&model.summary.capabilities) == Some(false)
+                        }) {
+                            self.status = Some(chat_unsupported_status(&model.summary.name));
+                        } else if was_waiting_for_metadata {
+                            self.status = Some(self.model_selection_status(&name));
+                        }
                     }
                     Err(error) => {
                         self.status = Some(format!("MODEL METADATA UNAVAILABLE // {error}"));
@@ -740,14 +773,26 @@ impl App {
             }
             InternalEvent::Transcription {
                 operation_id,
+                session_id,
                 result,
             } => {
-                if !self.is_current_voice_operation(operation_id) {
+                if !self.is_current_voice_operation(operation_id, session_id) {
                     return Ok(());
                 }
                 self.voice_cancel = None;
                 match result {
                     Ok(text) => {
+                        if self.model_hydration_pending {
+                            self.input.insert_str(&text);
+                            self.voice_state = VoiceState::Ready;
+                            self.activity = ActivityState::Idle;
+                            self.status = Some(
+                                "VOICE DECODED // kept in composer while model metadata loads"
+                                    .to_owned(),
+                            );
+                            self.dirty = true;
+                            return Ok(());
+                        }
                         self.voice_state = VoiceState::Thinking;
                         self.status = Some(format!("VOICE DECODED // {text}"));
                         self.send_content(text, MessageOrigin::Speech).await?;
@@ -761,23 +806,26 @@ impl App {
             }
             InternalEvent::TtsChunk {
                 operation_id,
+                session_id,
                 bytes,
             } => {
-                if !self.is_current_voice_operation(operation_id) {
+                if !self.is_current_voice_operation(operation_id, session_id) {
                     return Ok(());
                 }
                 if let Some(playback) = self.playback.as_mut() {
                     playback.enqueue_pcm16(&bytes, QWEN_TTS_SAMPLE_RATE);
                     self.voice_state = VoiceState::Speaking;
                     self.activity = ActivityState::Streaming;
-                    self.status = Some("AI VOICE // streaming local Qwen synthesis".to_owned());
+                    self.status =
+                        Some("AI VOICE // streaming configured Qwen synthesis".to_owned());
                 }
             }
             InternalEvent::TtsFinished {
                 operation_id,
+                session_id,
                 result,
             } => {
-                if !self.is_current_voice_operation(operation_id) {
+                if !self.is_current_voice_operation(operation_id, session_id) {
                     return Ok(());
                 }
                 match result {
@@ -848,7 +896,7 @@ impl App {
                 if let Some(warning) = context_warning {
                     self.status = Some(warning);
                 }
-                self.refresh_selected_model();
+                self.refresh_selected_model(false);
                 if self.voice_mode
                     && let Some(response) = spoken_response
                 {
@@ -972,15 +1020,22 @@ impl App {
             self.dirty = true;
             return Ok(());
         }
-        let Some(model_name) = self
-            .selected_model
-            .as_ref()
-            .map(|model| model.summary.name.clone())
-        else {
+        if self.model_hydration_pending {
+            self.status = Some("MODEL METADATA LOADING // wait before transmitting".to_owned());
+            self.dirty = true;
+            return Ok(());
+        }
+        let Some(selected_model) = self.selected_model.as_ref() else {
             self.open_models();
-            self.status = Some("SELECT A LOCAL MODEL BEFORE TRANSMITTING".to_owned());
+            self.status = Some("SELECT A CHAT MODEL BEFORE TRANSMITTING".to_owned());
             return Ok(());
         };
+        if model_chat_support(&selected_model.summary.capabilities) == Some(false) {
+            self.status = Some(chat_unsupported_status(&selected_model.summary.name));
+            self.dirty = true;
+            return Ok(());
+        }
+        let model_name = selected_model.summary.name.clone();
         if content.trim().is_empty() {
             return Ok(());
         }
@@ -1006,7 +1061,7 @@ impl App {
         self.activity = ActivityState::Thinking;
         if origin == MessageOrigin::Speech {
             self.voice_state = VoiceState::Thinking;
-            self.status = Some("AI THINKING // local model link active".to_owned());
+            self.status = Some("AI THINKING // configured chat route active".to_owned());
         } else {
             self.status = Some("ESTABLISHING MODEL LINK".to_owned());
         }
@@ -1017,14 +1072,8 @@ impl App {
         let backend = Arc::clone(&self.backend);
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
-            match backend.stream_chat(request, cancellation).await {
-                Ok(mut receiver) => {
-                    while let Some(event) = receiver.recv().await {
-                        if tx.send(InternalEvent::Chat(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
+            match backend.stream_chat(request, cancellation.clone()).await {
+                Ok(receiver) => forward_chat_events(receiver, tx, cancellation).await,
                 Err(error) => {
                     let _ = tx.send(InternalEvent::Chat(ChatEvent::Failed(error))).await;
                 }
@@ -1041,6 +1090,45 @@ impl App {
             self.status = Some("CANCELLING MODEL LINK".to_owned());
             self.dirty = true;
         }
+    }
+
+    fn model_selection_status(&self, active_model: &str) -> String {
+        self.session_mismatch_status(Some(active_model))
+            .unwrap_or_else(|| format!("MODEL SELECTED // {active_model}"))
+    }
+
+    fn session_backend_status(&self, normal: &str) -> String {
+        let active_model = self
+            .selected_model
+            .as_ref()
+            .map(|model| model.summary.name.as_str());
+        self.session_mismatch_status(active_model)
+            .unwrap_or_else(|| normal.to_owned())
+    }
+
+    fn session_mismatch_status(&self, active_model: Option<&str>) -> Option<String> {
+        let mut notices = Vec::new();
+        if self.session.backend != self.config.backend.storage_name() {
+            notices.push(format!(
+                "SESSION BACKEND MISMATCH // SAVED {} · ACTIVE {}",
+                stored_backend_label(&self.session.backend),
+                backend_label(self.config.backend)
+            ));
+        }
+        let previous_model = self
+            .session
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| message.model.as_deref());
+        if let (Some(previous), Some(active)) = (previous_model, active_model)
+            && previous != active
+        {
+            notices.push(format!(
+                "SESSION MODEL MISMATCH // LAST {previous} · ACTIVE {active}"
+            ));
+        }
+        (!notices.is_empty()).then(|| notices.join(" // "))
     }
 
     fn cancel_active_work(&mut self) {
@@ -1081,8 +1169,8 @@ impl App {
         (self.voice_operation_id, cancellation)
     }
 
-    fn is_current_voice_operation(&self, operation_id: u64) -> bool {
-        operation_id == self.voice_operation_id
+    fn is_current_voice_operation(&self, operation_id: u64, session_id: Uuid) -> bool {
+        operation_id == self.voice_operation_id && session_id == self.session.id
     }
 
     async fn request_quit(&mut self) -> Result<()> {
@@ -1161,7 +1249,7 @@ impl App {
         self.speech_refreshing = true;
         self.last_speech_attempt = Instant::now();
         if self.voice_mode {
-            self.status = Some("PROBING LOCAL MLX-AUDIO LINK".to_owned());
+            self.status = Some("PROBING CONFIGURED MLX-AUDIO ROUTE".to_owned());
         }
         let speech = Arc::clone(&self.speech);
         let tx = self.internal_tx.clone();
@@ -1231,6 +1319,11 @@ impl App {
     }
 
     async fn start_recording(&mut self) -> Result<()> {
+        if self.model_hydration_pending {
+            self.status = Some("MODEL METADATA LOADING // wait before recording".to_owned());
+            self.dirty = true;
+            return Ok(());
+        }
         if !self.speech_online {
             self.voice_state = VoiceState::Disarmed;
             self.status = Some("MLX-AUDIO OFFLINE // voice capture is disarmed".to_owned());
@@ -1239,7 +1332,7 @@ impl App {
         }
         if self.selected_model.is_none() {
             self.open_models();
-            self.status = Some("SELECT A LOCAL CHAT MODEL BEFORE RECORDING".to_owned());
+            self.status = Some("SELECT A CHAT MODEL BEFORE RECORDING".to_owned());
             return Ok(());
         }
         self.cancel_voice();
@@ -1291,10 +1384,11 @@ impl App {
             wav,
             language: None,
         };
+        let session_id = self.session.id;
         let (operation_id, cancellation) = self.begin_voice_operation();
         self.voice_state = VoiceState::Transcribing;
         self.status = Some(format!(
-            "QWEN ASR // decoding {:.1}s locally",
+            "QWEN ASR // decoding {:.1}s via configured speech route",
             audio.duration_seconds()
         ));
         let speech = Arc::clone(&self.speech);
@@ -1308,6 +1402,7 @@ impl App {
             let _ = tx
                 .send(InternalEvent::Transcription {
                     operation_id,
+                    session_id,
                     result,
                 })
                 .await;
@@ -1345,6 +1440,7 @@ impl App {
             self.config.speech.tts_voice.clone(),
         );
         let (operation_id, cancellation) = self.begin_voice_operation();
+        let session_id = self.session.id;
         let speech = Arc::clone(&self.speech);
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
@@ -1355,6 +1451,7 @@ impl App {
                     let _ = tx
                         .send(InternalEvent::TtsFinished {
                             operation_id,
+                            session_id,
                             result: Err(error.to_string()),
                         })
                         .await;
@@ -1375,6 +1472,7 @@ impl App {
                         if tx
                             .send(InternalEvent::TtsChunk {
                                 operation_id,
+                                session_id,
                                 bytes: bytes.to_vec(),
                             })
                             .await
@@ -1387,7 +1485,8 @@ impl App {
                         let _ = tx
                             .send(InternalEvent::TtsFinished {
                                 operation_id,
-                                result: Err(error.to_string()),
+                                session_id,
+                                result: Err(error.without_url().to_string()),
                             })
                             .await;
                         return;
@@ -1399,6 +1498,7 @@ impl App {
                         let _ = tx
                             .send(InternalEvent::TtsFinished {
                                 operation_id,
+                                session_id,
                                 result: Ok(()),
                             })
                             .await;
@@ -1462,14 +1562,20 @@ impl App {
         Ok(())
     }
 
-    fn refresh_selected_model(&self) {
+    fn refresh_selected_model(&mut self, wait_for_capabilities: bool) {
+        self.model_hydration_request_id = self.model_hydration_request_id.wrapping_add(1);
+        let request_id = self.model_hydration_request_id;
         let Some(name) = self
             .selected_model
             .as_ref()
             .map(|model| model.summary.name.clone())
         else {
+            self.model_hydration_pending = false;
             return;
         };
+        if wait_for_capabilities {
+            self.model_hydration_pending = true;
+        }
         let backend = Arc::clone(&self.backend);
         let tx = self.internal_tx.clone();
         tokio::spawn(async move {
@@ -1478,6 +1584,7 @@ impl App {
             let _ = tx
                 .send(InternalEvent::ModelHydrated(Box::new(ModelHydration {
                     name,
+                    request_id,
                     result,
                     running,
                 })))
@@ -1494,10 +1601,26 @@ impl App {
         let Some(summary) = self.models.get(index).cloned() else {
             return Ok(());
         };
+        if model_chat_support(&summary.capabilities) == Some(false) {
+            self.status = Some(chat_unsupported_status(&summary.name));
+            self.dirty = true;
+            return Ok(());
+        }
         if summary.is_cloud() && !self.config.allow_cloud_models {
             self.status = Some("CLOUD MODEL BLOCKED // enable explicitly in config".to_owned());
             return Ok(());
         }
+        let model_changed = self
+            .selected_model
+            .as_ref()
+            .is_none_or(|selected| selected.summary.name != summary.name);
+        if !model_changed {
+            self.overlay = None;
+            self.status = Some(self.model_selection_status(&summary.name));
+            self.dirty = true;
+            return Ok(());
+        }
+        self.cancel_voice();
         self.selected_model = Some(SelectedModel {
             summary: summary.clone(),
             ..SelectedModel::default()
@@ -1505,8 +1628,8 @@ impl App {
         self.persisted.last_model = Some(summary.name.clone());
         self.storage.save_state(&self.persisted).await?;
         self.overlay = None;
-        self.status = Some(format!("MODEL SELECTED // {}", summary.name));
-        self.refresh_selected_model();
+        self.status = Some(self.model_selection_status(&summary.name));
+        self.refresh_selected_model(true);
         Ok(())
     }
 
@@ -1520,9 +1643,12 @@ impl App {
             return Ok(());
         };
         let session = self.storage.load_session(summary.id).await?;
+        let mut persisted = self.persisted.clone();
+        persisted.recent_session = Some(session.id.to_string());
+        self.storage.save_state(&persisted).await?;
+        self.cancel_voice();
         self.session = session;
-        self.persisted.recent_session = Some(self.session.id.to_string());
-        self.storage.save_state(&self.persisted).await?;
+        self.persisted = persisted;
         self.last_usage = self
             .session
             .messages
@@ -1531,7 +1657,7 @@ impl App {
             .find_map(|message| message.usage.clone());
         self.transcript_scroll = TranscriptScroll::following_tail();
         self.overlay = None;
-        self.status = Some("SESSION LINK RESTORED".to_owned());
+        self.status = Some(self.session_backend_status("SESSION LINK RESTORED"));
         Ok(())
     }
 
@@ -1541,13 +1667,21 @@ impl App {
             self.dirty = true;
             return Ok(());
         }
-        self.session = self.storage.create_session().await?;
-        self.persisted.recent_session = Some(self.session.id.to_string());
-        self.storage.save_state(&self.persisted).await?;
-        self.sessions = self.storage.list_sessions().await?;
+        let session = self
+            .storage
+            .create_session_with_backend(self.config.backend)
+            .await?;
+        let mut persisted = self.persisted.clone();
+        persisted.recent_session = Some(session.id.to_string());
+        let sessions = self.storage.list_sessions().await?;
+        self.storage.save_state(&persisted).await?;
+        self.cancel_voice();
+        self.session = session;
+        self.persisted = persisted;
+        self.sessions = sessions;
         self.last_usage = None;
         self.transcript_scroll = TranscriptScroll::following_tail();
-        self.status = Some("NEW SESSION LINK".to_owned());
+        self.status = Some(self.session_backend_status("NEW SESSION LINK"));
         self.overlay = None;
         self.dirty = true;
         Ok(())
@@ -1556,7 +1690,7 @@ impl App {
     fn open_models(&mut self) {
         self.open_overlay(Overlay::Models);
         if self.models.is_empty() {
-            self.status = Some("NO LOCAL MODELS DETECTED".to_owned());
+            self.status = Some("NO MODELS DETECTED".to_owned());
         }
     }
 
@@ -1582,13 +1716,152 @@ impl App {
 }
 
 fn configure_input(input: &mut TextArea<'static>) {
-    input.set_placeholder_text("Transmit a message to the selected local model…");
+    input.set_placeholder_text("Transmit a message to the selected chat model…");
+}
+
+async fn forward_chat_events(
+    mut receiver: mpsc::Receiver<ChatEvent>,
+    events: mpsc::Sender<InternalEvent>,
+    cancellation: CancellationToken,
+) {
+    let mut terminal_event_forwarded = false;
+    while let Some(event) = receiver.recv().await {
+        terminal_event_forwarded |= matches!(
+            &event,
+            ChatEvent::Finished { .. } | ChatEvent::Failed(_) | ChatEvent::Cancelled
+        );
+        if events.send(InternalEvent::Chat(event)).await.is_err() {
+            return;
+        }
+    }
+    if cancellation.is_cancelled() && !terminal_event_forwarded {
+        let _ = events.send(InternalEvent::Chat(ChatEvent::Cancelled)).await;
+    }
+}
+
+async fn resolve_startup_session(
+    storage: &Storage,
+    config: &RuntimeConfig,
+    persisted: &mut AppStateFile,
+) -> Result<(LoadedSession, Option<String>)> {
+    let requested_session = config
+        .resume
+        .as_deref()
+        .or(persisted.recent_session.as_deref())
+        .and_then(|value| Uuid::parse_str(value).ok());
+
+    let (session, mut status) = if let Some(id) = requested_session {
+        match storage.load_session(id).await {
+            Ok(session) => {
+                let status = session
+                    .had_interruption
+                    .then(|| "RECOVERED // previous turn was interrupted".to_owned());
+                (session, status)
+            }
+            Err(error) => {
+                warn!(%error, "could not resume requested chat; creating a new one");
+                (
+                    storage.create_session_with_backend(config.backend).await?,
+                    Some("SESSION NOT FOUND // opened a new link".to_owned()),
+                )
+            }
+        }
+    } else {
+        (
+            storage.create_session_with_backend(config.backend).await?,
+            None,
+        )
+    };
+
+    if session.backend != config.backend.storage_name() {
+        let mismatch = format!(
+            "SESSION BACKEND MISMATCH // SAVED {} · ACTIVE {}",
+            stored_backend_label(&session.backend),
+            backend_label(config.backend)
+        );
+        status = Some(status.map_or(mismatch.clone(), |status| format!("{mismatch} // {status}")));
+    }
+
+    persisted.recent_session = Some(session.id.to_string());
+    storage.save_state(persisted).await?;
+    Ok((session, status))
 }
 
 const fn backend_label(backend: BackendKind) -> &'static str {
     match backend {
         BackendKind::Ollama => "OLLAMA",
         BackendKind::LlamaCpp => "LLAMA.CPP",
+    }
+}
+
+fn stored_backend_label(backend: &str) -> &'static str {
+    match backend {
+        "ollama" => "OLLAMA",
+        "llama_cpp" => "LLAMA.CPP",
+        _ => "UNKNOWN",
+    }
+}
+
+fn endpoint_location(url: &url::Url) -> RouteLocation {
+    if !matches!(url.scheme(), "http" | "https") {
+        return RouteLocation::Unknown;
+    }
+    match url.host() {
+        Some(url::Host::Ipv4(address)) if address.is_loopback() => RouteLocation::Loopback,
+        Some(url::Host::Ipv6(address)) if address.is_loopback() => RouteLocation::Loopback,
+        Some(url::Host::Ipv4(address)) if address.is_unspecified() => RouteLocation::Unknown,
+        Some(url::Host::Ipv6(address)) if address.is_unspecified() => RouteLocation::Unknown,
+        Some(url::Host::Domain(domain))
+            if domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost") =>
+        {
+            RouteLocation::Loopback
+        }
+        Some(url::Host::Domain(_) | url::Host::Ipv4(_) | url::Host::Ipv6(_)) => {
+            RouteLocation::Network
+        }
+        None => RouteLocation::Unknown,
+    }
+}
+
+fn merge_model_summary(hydrated: &mut ModelSummary, listed: &ModelSummary) {
+    if hydrated.name.is_empty() {
+        hydrated.name.clone_from(&listed.name);
+    }
+    if hydrated.size == 0 {
+        hydrated.size = listed.size;
+    }
+    if hydrated.digest.is_none() {
+        hydrated.digest.clone_from(&listed.digest);
+    }
+    merge_model_details(&mut hydrated.details, &listed.details);
+    for capability in &listed.capabilities {
+        if !hydrated.capabilities.contains(capability) {
+            hydrated.capabilities.push(capability.clone());
+        }
+    }
+    if hydrated.remote_model.is_none() {
+        hydrated.remote_model.clone_from(&listed.remote_model);
+    }
+    if hydrated.remote_host.is_none() {
+        hydrated.remote_host.clone_from(&listed.remote_host);
+    }
+}
+
+fn merge_model_details(hydrated: &mut ModelDetails, listed: &ModelDetails) {
+    if hydrated.parameter_size.is_none() {
+        hydrated.parameter_size.clone_from(&listed.parameter_size);
+    }
+    if hydrated.quantization_level.is_none() {
+        hydrated
+            .quantization_level
+            .clone_from(&listed.quantization_level);
+    }
+    if hydrated.format.is_none() {
+        hydrated.format.clone_from(&listed.format);
+    }
+    if hydrated.family.is_none() {
+        hydrated.family.clone_from(&listed.family);
     }
 }
 
@@ -1652,6 +1925,19 @@ fn visible_models(models: Vec<ModelSummary>, allow_cloud_models: bool) -> Vec<Mo
         .into_iter()
         .filter(|model| allow_cloud_models || !model.is_cloud())
         .collect()
+}
+
+fn model_chat_support(capabilities: &[String]) -> Option<bool> {
+    if capabilities.is_empty() {
+        return None;
+    }
+    Some(capabilities.iter().any(|capability| {
+        capability.eq_ignore_ascii_case("completion") || capability.eq_ignore_ascii_case("tools")
+    }))
+}
+
+fn chat_unsupported_status(model: &str) -> String {
+    format!("CHAT UNSUPPORTED // {model} does not advertise completion capability")
 }
 
 fn context_warning(usage: &Usage, allocated_context: Option<u64>) -> Option<String> {
@@ -1939,6 +2225,188 @@ mod tests {
     }
 
     #[test]
+    fn model_chat_support_distinguishes_unknown_and_incompatible_capabilities() {
+        assert_eq!(model_chat_support(&[]), None);
+        assert_eq!(model_chat_support(&["embedding".to_owned()]), Some(false));
+        assert_eq!(
+            model_chat_support(&["completion".to_owned(), "vision".to_owned()]),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn embedding_only_model_cannot_be_selected_or_sent_to() {
+        let (_temporary, mut app) = test_app().await;
+        app.models.push(ModelSummary {
+            name: "embed-only".to_owned(),
+            capabilities: vec!["embedding".to_owned()],
+            ..ModelSummary::default()
+        });
+
+        app.select_model(0).await.unwrap();
+        assert!(app.selected_model.is_none());
+        assert!(app.status.as_deref().unwrap().contains("CHAT UNSUPPORTED"));
+
+        app.selected_model = Some(SelectedModel {
+            summary: app.models[0].clone(),
+            ..SelectedModel::default()
+        });
+        app.send_content("hello".to_owned(), MessageOrigin::Typed)
+            .await
+            .unwrap();
+        assert!(app.session.messages.is_empty());
+        assert!(app.status.as_deref().unwrap().contains("CHAT UNSUPPORTED"));
+    }
+
+    #[tokio::test]
+    async fn unknown_model_waits_for_capability_hydration_before_chat() {
+        let (_temporary, mut app) = test_app().await;
+        app.models.push(ModelSummary {
+            name: "embedding-model".to_owned(),
+            ..ModelSummary::default()
+        });
+        app.select_model(0).await.unwrap();
+        assert!(app.model_hydration_pending);
+
+        app.send_content("hello".to_owned(), MessageOrigin::Typed)
+            .await
+            .unwrap();
+        assert!(app.session.messages.is_empty());
+        assert!(
+            app.status
+                .as_deref()
+                .unwrap()
+                .contains("MODEL METADATA LOADING")
+        );
+
+        let request_id = app.model_hydration_request_id;
+        app.handle_internal_event(InternalEvent::ModelHydrated(Box::new(ModelHydration {
+            name: "embedding-model".to_owned(),
+            request_id,
+            result: Ok(SelectedModel {
+                summary: ModelSummary {
+                    name: "embedding-model".to_owned(),
+                    capabilities: vec!["embedding".to_owned()],
+                    ..ModelSummary::default()
+                },
+                ..SelectedModel::default()
+            }),
+            running: Ok(Vec::new()),
+        })))
+        .await
+        .unwrap();
+
+        assert!(!app.model_hydration_pending);
+        app.send_content("hello".to_owned(), MessageOrigin::Typed)
+            .await
+            .unwrap();
+        assert!(app.session.messages.is_empty());
+        assert!(app.status.as_deref().unwrap().contains("CHAT UNSUPPORTED"));
+    }
+
+    #[tokio::test]
+    async fn stale_model_hydration_is_ignored_after_reselection() {
+        let (_temporary, mut app) = test_app().await;
+        app.model_hydration_request_id = 3;
+        app.selected_model = Some(SelectedModel {
+            summary: ModelSummary {
+                name: "qwen".to_owned(),
+                size: 9,
+                ..ModelSummary::default()
+            },
+            ..SelectedModel::default()
+        });
+
+        app.handle_internal_event(InternalEvent::ModelHydrated(Box::new(ModelHydration {
+            name: "qwen".to_owned(),
+            request_id: 1,
+            result: Ok(SelectedModel {
+                summary: ModelSummary {
+                    name: "qwen".to_owned(),
+                    size: 1,
+                    ..ModelSummary::default()
+                },
+                ..SelectedModel::default()
+            }),
+            running: Ok(Vec::new()),
+        })))
+        .await
+        .unwrap();
+
+        assert_eq!(app.selected_model.as_ref().unwrap().summary.size, 9);
+    }
+
+    #[tokio::test]
+    async fn successful_hydration_clears_a_waiting_status() {
+        let (_temporary, mut app) = test_app().await;
+        app.model_hydration_request_id = 1;
+        app.model_hydration_pending = true;
+        app.status = Some("MODEL METADATA LOADING // wait before transmitting".to_owned());
+        app.selected_model = Some(SelectedModel {
+            summary: ModelSummary {
+                name: "qwen".to_owned(),
+                ..ModelSummary::default()
+            },
+            ..SelectedModel::default()
+        });
+
+        app.handle_internal_event(InternalEvent::ModelHydrated(Box::new(ModelHydration {
+            name: "qwen".to_owned(),
+            request_id: 1,
+            result: Ok(SelectedModel {
+                summary: ModelSummary {
+                    name: "qwen".to_owned(),
+                    capabilities: vec!["completion".to_owned()],
+                    ..ModelSummary::default()
+                },
+                ..SelectedModel::default()
+            }),
+            running: Ok(Vec::new()),
+        })))
+        .await
+        .unwrap();
+
+        assert!(!app.model_hydration_pending);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.starts_with("MODEL SELECTED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_backend_queue_still_forwards_a_terminal_event() {
+        let (backend_events, backend_receiver) = mpsc::channel(1);
+        backend_events
+            .send(ChatEvent::ContentDelta("queued chunk".to_owned()))
+            .await
+            .unwrap();
+        let (app_events, mut app_receiver) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let forwarder = tokio::spawn(forward_chat_events(
+            backend_receiver,
+            app_events,
+            cancellation,
+        ));
+        drop(backend_events);
+
+        let Some(InternalEvent::Chat(event)) = app_receiver.recv().await else {
+            panic!("expected the queued content event");
+        };
+        assert_eq!(event, ChatEvent::ContentDelta("queued chunk".to_owned()));
+        let Some(InternalEvent::Chat(event)) =
+            tokio::time::timeout(Duration::from_secs(1), app_receiver.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("expected the synthesized cancellation event");
+        };
+        assert_eq!(event, ChatEvent::Cancelled);
+        forwarder.await.unwrap();
+    }
+
+    #[test]
     fn warns_at_eighty_percent_of_confirmed_allocation() {
         let usage = Usage {
             prompt_eval_count: Some(8_000),
@@ -2089,9 +2557,11 @@ mod tests {
         app.voice_operation_id = 7;
         let token = CancellationToken::new();
         app.voice_cancel = Some(token.clone());
+        let session_id = app.session.id;
 
         app.handle_internal_event(InternalEvent::Transcription {
             operation_id: 6,
+            session_id,
             result: Ok("stale utterance".to_owned()),
         })
         .await
@@ -2117,9 +2587,11 @@ mod tests {
         app.voice_state = VoiceState::Transcribing;
         app.voice_operation_id = 3;
         app.voice_cancel = Some(CancellationToken::new());
+        let session_id = app.session.id;
 
         app.handle_internal_event(InternalEvent::Transcription {
             operation_id: 3,
+            session_id,
             result: Ok("hello from this turn".to_owned()),
         })
         .await
@@ -2131,6 +2603,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transcription_during_model_hydration_is_kept_in_composer() {
+        let (_temporary, mut app) = test_app().await;
+        app.selected_model = Some(SelectedModel {
+            summary: ModelSummary {
+                name: "not-yet-hydrated".to_owned(),
+                ..ModelSummary::default()
+            },
+            ..SelectedModel::default()
+        });
+        app.model_hydration_pending = true;
+        app.voice_mode = true;
+        app.voice_state = VoiceState::Transcribing;
+        app.voice_operation_id = 9;
+        app.voice_cancel = Some(CancellationToken::new());
+
+        app.handle_internal_event(InternalEvent::Transcription {
+            operation_id: 9,
+            session_id: app.session.id,
+            result: Ok("keep this spoken text".to_owned()),
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.input.lines(), ["keep this spoken text"]);
+        assert!(app.session.messages.is_empty());
+        assert_eq!(app.voice_state, VoiceState::Ready);
+        assert!(app.voice_cancel.is_none());
+        assert!(app.status.as_deref().unwrap().contains("kept in composer"));
+    }
+
+    #[tokio::test]
     async fn stale_tts_failure_does_not_fail_the_current_operation() {
         let (_temporary, mut app) = test_app().await;
         app.voice_mode = true;
@@ -2138,9 +2641,11 @@ mod tests {
         app.voice_operation_id = 4;
         let token = CancellationToken::new();
         app.voice_cancel = Some(token.clone());
+        let session_id = app.session.id;
 
         app.handle_internal_event(InternalEvent::TtsFinished {
             operation_id: 3,
+            session_id,
             result: Err("late synthesis".to_owned()),
         })
         .await

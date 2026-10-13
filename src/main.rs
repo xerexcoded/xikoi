@@ -1,13 +1,21 @@
 use std::{
     fs::{File, OpenOptions},
+    io,
     path::Path,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::SystemTime,
 };
 
 use chrono::Utc;
 use clap::Parser;
 use color_eyre::eyre::{Context, Result};
+use crossterm::{
+    event::{DisableBracketedPaste, EnableBracketedPaste},
+    execute,
+};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 use xikoi::{
@@ -67,9 +75,52 @@ async fn main() -> Result<()> {
     let mut app = App::bootstrap(config, storage, backend).await?;
 
     let mut terminal = ratatui::init();
+    let terminal_session = TerminalSession::new();
+    TerminalSession::enable_bracketed_paste()?;
     let result = app.run(&mut terminal).await;
-    ratatui::restore();
+    terminal_session.restore();
     result
+}
+
+struct TerminalSession {
+    active: Arc<AtomicBool>,
+}
+
+impl TerminalSession {
+    fn new() -> Self {
+        let active = Arc::new(AtomicBool::new(true));
+        let panic_active = Arc::clone(&active);
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            if panic_active.swap(false, Ordering::SeqCst) {
+                let _ = execute!(io::stdout(), DisableBracketedPaste);
+            }
+            previous_hook(panic_info);
+        }));
+
+        Self { active }
+    }
+
+    fn enable_bracketed_paste() -> Result<()> {
+        execute!(io::stdout(), EnableBracketedPaste)
+            .wrap_err("could not enable bracketed paste mode")?;
+        Ok(())
+    }
+
+    fn restore(&self) {
+        if self.active.swap(false, Ordering::SeqCst) {
+            if let Err(error) = execute!(io::stdout(), DisableBracketedPaste) {
+                tracing::warn!(%error, "could not disable bracketed paste mode");
+            }
+            ratatui::restore();
+        }
+    }
+}
+
+impl Drop for TerminalSession {
+    fn drop(&mut self) {
+        self.restore();
+    }
 }
 
 fn initialize_logging(paths: &AppPaths) -> Result<tracing_appender::non_blocking::WorkerGuard> {

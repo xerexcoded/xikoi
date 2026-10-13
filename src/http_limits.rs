@@ -5,6 +5,8 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::Response;
+use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 /// TCP connect budget for Ollama, llama.cpp, and similar local servers.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -22,6 +24,13 @@ pub const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 pub enum LimitedBodyError {
     TooLarge { limit: usize },
     Transport(reqwest::Error),
+}
+
+#[derive(Debug)]
+pub enum CancellableBodyError {
+    Cancelled,
+    TimedOut,
+    Body(LimitedBodyError),
 }
 
 impl LimitedBodyError {
@@ -60,6 +69,27 @@ pub async fn read_limited_body(
         body.extend_from_slice(&chunk);
     }
     Ok(body.freeze())
+}
+
+/// Read a bounded response body until it completes, cancellation is requested,
+/// or the supplied deadline elapses.
+pub async fn read_limited_body_cancellable(
+    response: Response,
+    limit: usize,
+    cancellation: &CancellationToken,
+    deadline: Duration,
+) -> Result<Bytes, CancellableBodyError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(CancellableBodyError::Cancelled),
+        result = timeout(deadline, read_limited_body(response, limit)) => {
+            match result {
+                Ok(Ok(body)) => Ok(body),
+                Ok(Err(error)) => Err(CancellableBodyError::Body(error)),
+                Err(_) => Err(CancellableBodyError::TimedOut),
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -5,6 +5,7 @@ use bytes::BytesMut;
 use futures_util::StreamExt;
 use reqwest::{Client, Response, StatusCode};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -16,8 +17,8 @@ use crate::{
         SelectedModel, Usage,
     },
     http_limits::{
-        CONNECT_TIMEOUT, LimitedBodyError, MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES,
-        REQUEST_TIMEOUT, read_limited_body,
+        CONNECT_TIMEOUT, CancellableBodyError, LimitedBodyError, MAX_ERROR_BODY_BYTES,
+        MAX_JSON_BODY_BYTES, REQUEST_TIMEOUT, read_limited_body, read_limited_body_cancellable,
     },
 };
 
@@ -58,7 +59,7 @@ impl LlamaCppBackend {
             .timeout(self.request_timeout)
             .send()
             .await
-            .map_err(|error| self.transport_failure(&error))?;
+            .map_err(|error| self.transport_failure(error))?;
         self.decode_json(response).await
     }
 
@@ -87,11 +88,28 @@ impl LlamaCppBackend {
             LimitedBodyError::TooLarge { limit } => protocol(format!(
                 "llama.cpp returned a response larger than {limit} bytes"
             )),
-            LimitedBodyError::Transport(error) => self.transport_failure(&error),
+            LimitedBodyError::Transport(error) => self.transport_failure(error),
         }
     }
 
-    fn transport_failure(&self, error: &reqwest::Error) -> BackendFailure {
+    fn cancellable_body_failure(
+        &self,
+        status: StatusCode,
+        error: CancellableBodyError,
+    ) -> BackendFailure {
+        match error {
+            CancellableBodyError::Cancelled => BackendFailure {
+                kind: BackendErrorKind::Unavailable,
+                message: "llama.cpp error response body read was cancelled".to_owned(),
+            },
+            CancellableBodyError::TimedOut => unavailable(format!(
+                "timed out while reading the llama.cpp HTTP {status} error response body"
+            )),
+            CancellableBodyError::Body(error) => self.limited_body_failure(error),
+        }
+    }
+
+    fn transport_failure(&self, error: reqwest::Error) -> BackendFailure {
         let kind = if error.is_connect() || error.is_timeout() {
             BackendErrorKind::Unavailable
         } else {
@@ -100,8 +118,9 @@ impl LlamaCppBackend {
         BackendFailure {
             kind,
             message: format!(
-                "llama.cpp is unavailable at {}: {error}",
-                self.base_url.as_str().trim_end_matches('/')
+                "llama.cpp is unavailable at {}: {}",
+                crate::config::redact_endpoint(&self.base_url),
+                error.without_url()
             ),
         }
     }
@@ -119,7 +138,9 @@ impl ChatBackend for LlamaCppBackend {
         }
         Ok(BackendInfo {
             version: "llama.cpp".to_owned(),
-            endpoint: self.base_url.as_str().trim_end_matches('/').to_owned(),
+            endpoint: crate::config::redact_endpoint(&self.base_url)
+                .trim_end_matches('/')
+                .to_owned(),
         })
     }
 
@@ -175,13 +196,25 @@ impl ChatBackend for LlamaCppBackend {
                 let _ = events.send(ChatEvent::Cancelled).await;
                 return Ok(receiver);
             }
-            response = dispatch => response.map_err(|error| self.transport_failure(&error))?,
+            response = dispatch => response.map_err(|error| self.transport_failure(error))?,
         };
         if !response.status().is_success() {
             let status = response.status();
-            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
-                .await
-                .map_err(|error| self.limited_body_failure(error))?;
+            let body = match read_limited_body_cancellable(
+                response,
+                MAX_ERROR_BODY_BYTES,
+                &cancellation,
+                self.request_timeout,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(CancellableBodyError::Cancelled) => {
+                    let _ = events.try_send(ChatEvent::Cancelled);
+                    return Ok(receiver);
+                }
+                Err(error) => return Err(self.cancellable_body_failure(status, error)),
+            };
             return Err(status_failure(status, &body));
         }
         tokio::spawn(consume_sse(response, events, cancellation, started));
@@ -203,8 +236,9 @@ async fn consume_sse(
 
     loop {
         let next = tokio::select! {
+            biased;
             () = cancellation.cancelled() => {
-                let _ = events.send(ChatEvent::Cancelled).await;
+                emit_cancelled(&events);
                 return;
             }
             next = bytes.next() => next,
@@ -214,7 +248,7 @@ async fn consume_sse(
                 let lines = match framer.push(&chunk) {
                     Ok(lines) => lines,
                     Err(error) => {
-                        let _ = events.send(ChatEvent::Failed(error)).await;
+                        let _ = emit_event(&events, ChatEvent::Failed(error), &cancellation).await;
                         return;
                     }
                 };
@@ -233,18 +267,15 @@ async fn consume_sse(
                         Ok(LineResult::Continue) => {}
                         Ok(LineResult::Done) => return,
                         Err(error) => {
-                            let _ = events.send(ChatEvent::Failed(error)).await;
+                            let _ =
+                                emit_event(&events, ChatEvent::Failed(error), &cancellation).await;
                             return;
                         }
                     }
                 }
             }
             Some(Err(error)) => {
-                let _ = events
-                    .send(ChatEvent::Failed(unavailable(format!(
-                        "llama.cpp stream failed: {error}"
-                    ))))
-                    .await;
+                emit_stream_failure(error, &events, &cancellation).await;
                 return;
             }
             None => {
@@ -264,26 +295,59 @@ async fn consume_sse(
                             Ok(LineResult::Done) => return,
                             Ok(LineResult::Continue) => {}
                             Err(error) => {
-                                let _ = events.send(ChatEvent::Failed(error)).await;
+                                let _ =
+                                    emit_event(&events, ChatEvent::Failed(error), &cancellation)
+                                        .await;
                                 return;
                             }
                         }
                     }
                     Ok(None) => {}
                     Err(error) => {
-                        let _ = events.send(ChatEvent::Failed(error)).await;
+                        let _ = emit_event(&events, ChatEvent::Failed(error), &cancellation).await;
                         return;
                     }
                 }
-                let _ = events
-                    .send(ChatEvent::Failed(protocol(
+                let _ = emit_event(
+                    &events,
+                    ChatEvent::Failed(protocol(
                         "llama.cpp closed the stream before [DONE]".to_owned(),
-                    )))
-                    .await;
+                    )),
+                    &cancellation,
+                )
+                .await;
                 return;
             }
         }
     }
+}
+
+async fn emit_stream_failure(
+    error: reqwest::Error,
+    events: &mpsc::Sender<ChatEvent>,
+    cancellation: &CancellationToken,
+) {
+    let failure = unavailable(format!("llama.cpp stream failed: {}", error.without_url()));
+    let _ = emit_event(events, ChatEvent::Failed(failure), cancellation).await;
+}
+
+async fn emit_event(
+    events: &mpsc::Sender<ChatEvent>,
+    event: ChatEvent,
+    cancellation: &CancellationToken,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => {
+            emit_cancelled(events);
+            false
+        }
+        result = events.send(event) => result.is_ok(),
+    }
+}
+
+fn emit_cancelled(events: &mpsc::Sender<ChatEvent>) {
+    let _ = events.try_send(ChatEvent::Cancelled);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -306,19 +370,25 @@ async fn consume_sse_line(
     let data = data.strip_prefix(b" ").unwrap_or(data);
     if data == b"[DONE]" {
         if cancellation.is_cancelled() {
-            let _ = events.send(ChatEvent::Cancelled).await;
+            emit_cancelled(events);
         } else {
-            let _ = events
-                .send(ChatEvent::Finished {
+            let _ = emit_event(
+                events,
+                ChatEvent::Finished {
                     reason: finish_reason.take(),
                     usage: usage.clone(),
-                })
-                .await;
+                },
+                cancellation,
+            )
+            .await;
         }
         return Ok(LineResult::Done);
     }
     let chunk: ChatChunk = serde_json::from_slice(data)
         .map_err(|error| protocol(format!("invalid llama.cpp SSE JSON: {error}")))?;
+    if let Some(error) = chunk.error {
+        return Err(stream_error_failure(&error));
+    }
     if let Some(wire_usage) = chunk.usage {
         usage.prompt_eval_count = wire_usage.prompt_tokens;
         usage.eval_count = wire_usage.completion_tokens;
@@ -331,10 +401,7 @@ async fn consume_sse_line(
             .delta
             .reasoning_content
             .filter(|value| !value.is_empty())
-            && events
-                .send(ChatEvent::ThinkingDelta(thinking))
-                .await
-                .is_err()
+            && !emit_event(events, ChatEvent::ThinkingDelta(thinking), cancellation).await
         {
             return Ok(LineResult::Done);
         }
@@ -344,7 +411,7 @@ async fn consume_sse_line(
                     Some(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
                 *emitted_content = true;
             }
-            if events.send(ChatEvent::ContentDelta(content)).await.is_err() {
+            if !emit_event(events, ChatEvent::ContentDelta(content), cancellation).await {
                 return Ok(LineResult::Done);
             }
         }
@@ -456,6 +523,7 @@ struct ChatChunk {
     #[serde(default)]
     choices: Vec<WireChoice>,
     usage: Option<WireUsage>,
+    error: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,6 +543,20 @@ struct WireDelta {
 struct WireUsage {
     prompt_tokens: Option<u64>,
     completion_tokens: Option<u64>,
+}
+
+fn stream_error_failure(error: &Value) -> BackendFailure {
+    let message = error
+        .as_str()
+        .or_else(|| error.get("message").and_then(Value::as_str))
+        .or_else(|| error.get("error").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .map_or_else(|| error.to_string(), ToOwned::to_owned);
+    BackendFailure {
+        kind: BackendErrorKind::Server,
+        message: format!("llama.cpp returned a streaming error: {message}"),
+    }
 }
 
 fn normalize_base_url(mut url: Url) -> Url {
@@ -577,6 +659,40 @@ mod tests {
         };
         assert_eq!(usage.prompt_eval_count, Some(4));
         assert_eq!(usage.eval_count, Some(1));
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_wait_for_a_full_event_queue() {
+        let (events, mut receiver) = mpsc::channel(1);
+        events
+            .send(ChatEvent::ContentDelta("queued chunk".to_owned()))
+            .await
+            .unwrap();
+        let cancellation = CancellationToken::new();
+        let task_events = events.clone();
+        let task_cancellation = cancellation.clone();
+        let sender = tokio::spawn(async move {
+            emit_event(
+                &task_events,
+                ChatEvent::ContentDelta("blocked chunk".to_owned()),
+                &task_cancellation,
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        assert!(
+            !tokio::time::timeout(Duration::from_secs(1), sender)
+                .await
+                .expect("cancellation should release the blocked producer")
+                .expect("the sender task should not panic")
+        );
+        assert_eq!(
+            receiver.recv().await,
+            Some(ChatEvent::ContentDelta("queued chunk".to_owned()))
+        );
     }
 
     #[test]

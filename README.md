@@ -166,9 +166,20 @@ Xikoi captures with CoreAudio through CPAL, mixes the microphone to mono,
 resamples it to 16 kHz, and sends an in-memory WAV to
 `/v1/audio/transcriptions`. MLX-Audio streams signed 16-bit 24 kHz PCM from
 `/v1/audio/speech`; Xikoi resamples and plays it through the selected output.
-Raw captured audio is never saved. Voice turns are half-duplex to avoid feeding
-speaker output back into ASR; press Space while the AI is speaking for manual
-barge-in.
+The pinned [MLX-Audio v0.4.7 ASR server](https://github.com/Blaizzy/mlx-audio/blob/v0.4.7/mlx_audio/server.py#L259-L303)
+writes each uploaded recording to a temporary file under `/tmp` and removes it
+in its normal request cleanup. Raw audio is therefore transiently written to
+disk; this cleanup does not guarantee removal after a crash or forced shutdown.
+The installed wheel has not been independently checked. Voice turns are
+half-duplex to avoid feeding speaker output back into ASR; press Space while the
+AI is speaking for manual barge-in.
+
+The transcript header shows the configured chat and speech routes. `LOOPBACK`
+means Xikoi connects to a loopback URL, `NETWORK` means a network host, and
+`CLOUD` identifies an Ollama cloud model. A loopback proxy can forward traffic
+elsewhere, so these labels describe configured destinations rather than the
+server's final inference location. Setting `speech.url` or `--speech-url` to a
+remote host sends captured audio and speech requests to that host.
 
 The Audio Matrix lists every microphone and output route exposed by the host.
 For simultaneous playback through multiple physical devices, create a macOS

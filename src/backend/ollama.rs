@@ -18,8 +18,8 @@ use crate::{
         ModelSummary, SelectedModel, Usage,
     },
     http_limits::{
-        CONNECT_TIMEOUT, LimitedBodyError, MAX_ERROR_BODY_BYTES, MAX_JSON_BODY_BYTES,
-        REQUEST_TIMEOUT, read_limited_body,
+        CONNECT_TIMEOUT, CancellableBodyError, LimitedBodyError, MAX_ERROR_BODY_BYTES,
+        MAX_JSON_BODY_BYTES, REQUEST_TIMEOUT, read_limited_body, read_limited_body_cancellable,
     },
 };
 
@@ -71,7 +71,7 @@ impl OllamaBackend {
             .timeout(self.request_timeout)
             .send()
             .await
-            .map_err(|error| self.transport_failure(&error))?;
+            .map_err(|error| self.transport_failure(error))?;
         self.decode_json(response).await
     }
 
@@ -88,7 +88,7 @@ impl OllamaBackend {
             .json(body)
             .send()
             .await
-            .map_err(|error| self.transport_failure(&error))?;
+            .map_err(|error| self.transport_failure(error))?;
         self.decode_json(response).await
     }
 
@@ -117,11 +117,31 @@ impl OllamaBackend {
             LimitedBodyError::TooLarge { limit } => protocol_failure(format!(
                 "Ollama returned a response larger than {limit} bytes"
             )),
-            LimitedBodyError::Transport(error) => self.transport_failure(&error),
+            LimitedBodyError::Transport(error) => self.transport_failure(error),
         }
     }
 
-    fn transport_failure(&self, error: &reqwest::Error) -> BackendFailure {
+    fn cancellable_body_failure(
+        &self,
+        status: StatusCode,
+        error: CancellableBodyError,
+    ) -> BackendFailure {
+        match error {
+            CancellableBodyError::Cancelled => BackendFailure {
+                kind: BackendErrorKind::Unavailable,
+                message: "Ollama error response body read was cancelled".to_owned(),
+            },
+            CancellableBodyError::TimedOut => BackendFailure {
+                kind: BackendErrorKind::Unavailable,
+                message: format!(
+                    "timed out while reading the Ollama HTTP {status} error response body"
+                ),
+            },
+            CancellableBodyError::Body(error) => self.limited_body_failure(error),
+        }
+    }
+
+    fn transport_failure(&self, error: reqwest::Error) -> BackendFailure {
         let kind = if error.is_connect() || error.is_timeout() {
             BackendErrorKind::Unavailable
         } else {
@@ -130,8 +150,9 @@ impl OllamaBackend {
         BackendFailure {
             kind,
             message: format!(
-                "Ollama is unavailable at {}: {error}",
-                self.base_url.as_str().trim_end_matches('/')
+                "Ollama is unavailable at {}: {}",
+                crate::config::redact_endpoint(&self.base_url),
+                error.without_url()
             ),
         }
     }
@@ -149,7 +170,7 @@ impl OllamaBackend {
             })
             .send()
             .await
-            .map_err(|error| self.transport_failure(&error))?;
+            .map_err(|error| self.transport_failure(error))?;
         let status = response.status();
         if !status.is_success() {
             let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
@@ -162,7 +183,7 @@ impl OllamaBackend {
         let mut framer = NdjsonFramer::default();
         let mut completed = false;
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|error| self.transport_failure(&error))?;
+            let chunk = chunk.map_err(|error| self.transport_failure(error))?;
             for line in framer.push(&chunk)? {
                 completed |= consume_pull_record(&line, &mut on_progress)?;
             }
@@ -249,7 +270,9 @@ impl ChatBackend for OllamaBackend {
         }
         Ok(BackendInfo {
             version: response.version,
-            endpoint: self.base_url.as_str().trim_end_matches('/').to_owned(),
+            endpoint: crate::config::redact_endpoint(&self.base_url)
+                .trim_end_matches('/')
+                .to_owned(),
         })
     }
 
@@ -318,15 +341,27 @@ impl ChatBackend for OllamaBackend {
                 return Ok(receiver);
             }
             result = send => {
-                result.map_err(|error| self.transport_failure(&error))?
+                result.map_err(|error| self.transport_failure(error))?
             }
         };
 
         let status = response.status();
         if !status.is_success() {
-            let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
-                .await
-                .map_err(|error| self.limited_body_failure(error))?;
+            let body = match read_limited_body_cancellable(
+                response,
+                MAX_ERROR_BODY_BYTES,
+                &cancellation,
+                self.request_timeout,
+            )
+            .await
+            {
+                Ok(body) => body,
+                Err(CancellableBodyError::Cancelled) => {
+                    let _ = events.try_send(ChatEvent::Cancelled);
+                    return Ok(receiver);
+                }
+                Err(error) => return Err(self.cancellable_body_failure(status, error)),
+            };
             return Err(status_failure(status, &body));
         }
 
@@ -386,7 +421,10 @@ async fn consume_chat_stream(
                 state
                     .emit_terminal(ChatEvent::Failed(BackendFailure {
                         kind: BackendErrorKind::Unavailable,
-                        message: format!("the Ollama response stream failed: {error}"),
+                        message: format!(
+                            "the Ollama response stream failed: {}",
+                            error.without_url()
+                        ),
                     }))
                     .await;
                 return;
@@ -523,7 +561,11 @@ impl ChatStreamState {
     }
 
     async fn emit_terminal(&self, event: ChatEvent) {
-        let _ = self.events.send(event).await;
+        if matches!(&event, ChatEvent::Cancelled) {
+            let _ = self.events.try_send(event);
+        } else {
+            let _ = self.events.send(event).await;
+        }
     }
 }
 
