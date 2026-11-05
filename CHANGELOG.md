@@ -3,6 +3,31 @@
 All notable Xikoi changes are recorded here. Releases follow semantic
 versioning.
 
+## 0.1.3 - 2026-11-05
+
+- Harden startup against corrupt state and broken chat logs: preserve a corrupt
+  `state.json` under a unique `.corrupt` backup and skip individual unreadable
+  sessions instead of aborting listing or startup.
+- Synthesize a terminal chat event when a backend stream closes without one, so
+  generation can no longer remain locked.
+- Preserve valid voice transcriptions in the composer when the link is busy, and
+  cancel active capture/playback when the speech server disappears.
+- Return a clear error when an explicitly selected audio device disconnects and
+  refuse route changes while a stream on that direction is active.
+- Add start and idle-read deadlines for chat streams and model pulls, make
+  Ollama failure delivery cancellation-aware, and parse legacy llama.cpp
+  `error:` records as failures.
+- Check unterminated stream records against the size limit before growing the
+  framer buffer, and bound the setup TTS warm-up response.
+- Force `HF_HUB_OFFLINE` for managed/foreground inference and redact URL
+  credentials from voice and setup error paths.
+- Compute context occupancy from prompt plus generated tokens with saturating
+  arithmetic, clear stale usage on model changes, and exclude failed/cancelled
+  assistant placeholders from outgoing history.
+- Clamp scroll and model indices, fix the one-row dual oscilloscope width,
+  preserve line style and alignment while wrapping, and guard voice-mode
+  composer input.
+
 ## 0.1.2 - 2026-10-13
 
 - Bind asynchronous voice work to its session and cancel it when sessions or models
