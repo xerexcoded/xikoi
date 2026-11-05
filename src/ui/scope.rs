@@ -136,8 +136,13 @@ pub fn render_dual_scopes(
     }
 
     if area.height <= 1 {
+        // Labels total five cells: "U " plus " A ". Reserve exactly that so
+        // the two traces share every remaining column.
+        const LABEL_CELLS: usize = 5;
         let user_width = usize::from(area.width / 2).saturating_sub(2);
-        let ai_width = usize::from(area.width).saturating_sub(user_width + 4);
+        let ai_width = usize::from(area.width)
+            .saturating_sub(user_width)
+            .saturating_sub(LABEL_CELLS);
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("U ", theme.muted),

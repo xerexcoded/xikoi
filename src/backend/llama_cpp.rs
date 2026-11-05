@@ -18,7 +18,8 @@ use crate::{
     },
     http_limits::{
         CONNECT_TIMEOUT, CancellableBodyError, LimitedBodyError, MAX_ERROR_BODY_BYTES,
-        MAX_JSON_BODY_BYTES, REQUEST_TIMEOUT, read_limited_body, read_limited_body_cancellable,
+        MAX_JSON_BODY_BYTES, REQUEST_TIMEOUT, STREAM_IDLE_TIMEOUT, STREAM_START_TIMEOUT,
+        read_limited_body, read_limited_body_cancellable,
     },
 };
 
@@ -186,17 +187,26 @@ impl ChatBackend for LlamaCppBackend {
         let (events, receiver) = mpsc::channel(CHAT_EVENT_CHANNEL_CAPACITY);
         let payload = ChatPayload::from(&request);
         let started = Instant::now();
-        let dispatch = self
-            .client
-            .post(self.endpoint("v1/chat/completions")?)
-            .json(&payload)
-            .send();
+        let dispatch = tokio::time::timeout(
+            STREAM_START_TIMEOUT,
+            self.client
+                .post(self.endpoint("v1/chat/completions")?)
+                .json(&payload)
+                .send(),
+        );
         let response = tokio::select! {
             () = cancellation.cancelled() => {
                 let _ = events.send(ChatEvent::Cancelled).await;
                 return Ok(receiver);
             }
-            response = dispatch => response.map_err(|error| self.transport_failure(error))?,
+            response = dispatch => match response {
+                Ok(send) => send.map_err(|error| self.transport_failure(error))?,
+                Err(_) => {
+                    return Err(protocol(
+                        "timed out waiting for the llama.cpp response headers".to_owned(),
+                    ));
+                }
+            },
         };
         if !response.status().is_success() {
             let status = response.status();
@@ -222,6 +232,7 @@ impl ChatBackend for LlamaCppBackend {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn consume_sse(
     response: Response,
     events: mpsc::Sender<ChatEvent>,
@@ -241,7 +252,21 @@ async fn consume_sse(
                 emit_cancelled(&events);
                 return;
             }
-            next = bytes.next() => next,
+            result = tokio::time::timeout(STREAM_IDLE_TIMEOUT, bytes.next()) => {
+                if let Ok(next) = result {
+                    next
+                } else {
+                    let _ = emit_event(
+                        &events,
+                        ChatEvent::Failed(protocol(
+                            "the llama.cpp stream stalled".to_owned(),
+                        )),
+                        &cancellation,
+                    )
+                    .await;
+                    return;
+                }
+            }
         };
         match next {
             Some(Ok(chunk)) => {
@@ -364,6 +389,16 @@ async fn consume_sse_line(
     if line.is_empty() || line.starts_with(b":") || line.starts_with(b"event:") {
         return Ok(LineResult::Continue);
     }
+    // Legacy llama.cpp servers signal failures with a bare `error:` field
+    // rather than a JSON `data:` record. Treat it as a hard failure instead of
+    // silently skipping it and later reporting an unterminated stream.
+    if let Some(message) = line.strip_prefix(b"error:") {
+        let message = String::from_utf8_lossy(message.strip_prefix(b" ").unwrap_or(message));
+        return Err(BackendFailure {
+            kind: BackendErrorKind::Server,
+            message: format!("llama.cpp returned a streaming error: {}", message.trim()),
+        });
+    }
     let Some(data) = line.strip_prefix(b"data:") else {
         return Ok(LineResult::Continue);
     };
@@ -445,10 +480,12 @@ impl SseFramer {
             offset = end + 1;
         }
         if offset < chunk.len() {
-            self.buffer.extend_from_slice(&chunk[offset..]);
-            if self.buffer.len() > MAX_SSE_LINE_BYTES {
+            // Reject an oversized unterminated tail *before* growing the buffer.
+            let tail = &chunk[offset..];
+            if self.buffer.len().saturating_add(tail.len()) > MAX_SSE_LINE_BYTES {
                 return Err(protocol("llama.cpp SSE line exceeded 16 MiB".to_owned()));
             }
+            self.buffer.extend_from_slice(tail);
         }
         Ok(lines)
     }
@@ -693,6 +730,30 @@ mod tests {
             receiver.recv().await,
             Some(ChatEvent::ContentDelta("queued chunk".to_owned()))
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_error_records_are_parsed_as_failures() {
+        let (events, _receiver) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let mut usage = Usage::default();
+        let mut finish_reason = None;
+        let mut emitted_content = false;
+
+        let error = consume_sse_line(
+            b"error: model runner stopped",
+            &events,
+            &cancellation,
+            Instant::now(),
+            &mut usage,
+            &mut finish_reason,
+            &mut emitted_content,
+        )
+        .await
+        .expect_err("a legacy error: record must be a failure");
+
+        assert_eq!(error.kind, BackendErrorKind::Server);
+        assert!(error.message.contains("model runner stopped"));
     }
 
     #[test]

@@ -467,6 +467,13 @@ fn select_device(
         }) {
             return Ok(devices.swap_remove(position));
         }
+        // The user explicitly selected a device that has since disconnected.
+        // Silently routing to the system default would risk recording or
+        // playing through the wrong hardware, so surface a hard error instead.
+        return Err(AudioFailure::DeviceUnavailable {
+            direction,
+            id: id.to_owned(),
+        });
     }
     match direction {
         AudioDirection::Input => host.default_input_device(),
@@ -676,6 +683,11 @@ pub enum AudioFailure {
     Cpal(#[source] cpal::Error),
     #[error("no {0:?} audio device is available")]
     NoDevice(AudioDirection),
+    #[error("the selected {direction:?} device is no longer available (id {id})")]
+    DeviceUnavailable {
+        direction: AudioDirection,
+        id: String,
+    },
     #[error("audio sample format {0} is not supported yet")]
     UnsupportedSampleFormat(SampleFormat),
     #[error("could not encode captured audio: {0}")]

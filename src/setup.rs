@@ -16,6 +16,7 @@ use crate::{
     audio::{AudioInventory, QWEN_TTS_SAMPLE_RATE, RecordedAudio},
     backend::{ChatBackend, llama_cpp::LlamaCppBackend, ollama::OllamaBackend},
     config::{BackendKind, RuntimeConfig, SetupArgs},
+    http_limits::{MAX_JSON_BODY_BYTES, read_limited_body},
     speech::{MlxAudioClient, SynthesisRequest, TranscriptionRequest},
     storage::Storage,
     voice_runtime::{VoiceRuntime, find_program},
@@ -283,7 +284,7 @@ async fn ensure_ollama(config: &RuntimeConfig) -> Result<OllamaBackend> {
     if !is_loopback_url(&config.ollama_url) {
         bail!(
             "Ollama is unavailable at {}; Xikoi will not install or start software for a remote endpoint",
-            config.ollama_url
+            crate::config::redact_endpoint(&config.ollama_url)
         );
     }
 
@@ -393,7 +394,9 @@ async fn warm_voice_models(config: &RuntimeConfig) -> Result<()> {
             &cancellation,
         )
         .await?;
-    let pcm = response.bytes().await?;
+    let pcm = read_limited_body(response, MAX_JSON_BODY_BYTES)
+        .await
+        .map_err(|error| eyre!("TTS warm-up response failed: {}", error.message()))?;
     if pcm.len() < 2 {
         bail!("MLX-Audio returned no PCM during TTS warm-up");
     }

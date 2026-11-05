@@ -19,7 +19,8 @@ use crate::{
     },
     http_limits::{
         CONNECT_TIMEOUT, CancellableBodyError, LimitedBodyError, MAX_ERROR_BODY_BYTES,
-        MAX_JSON_BODY_BYTES, REQUEST_TIMEOUT, read_limited_body, read_limited_body_cancellable,
+        MAX_JSON_BODY_BYTES, REQUEST_TIMEOUT, STREAM_IDLE_TIMEOUT, STREAM_START_TIMEOUT,
+        read_limited_body, read_limited_body_cancellable,
     },
 };
 
@@ -161,16 +162,19 @@ impl OllamaBackend {
     where
         F: FnMut(&PullProgress),
     {
-        let response = self
-            .client
-            .post(self.endpoint("api/pull")?)
-            .json(&PullRequest {
-                model,
-                stream: true,
-            })
-            .send()
-            .await
-            .map_err(|error| self.transport_failure(error))?;
+        let response = tokio::time::timeout(
+            STREAM_START_TIMEOUT,
+            self.client
+                .post(self.endpoint("api/pull")?)
+                .json(&PullRequest {
+                    model,
+                    stream: true,
+                })
+                .send(),
+        )
+        .await
+        .map_err(|_| protocol_failure("timed out waiting for the Ollama pull response".to_owned()))?
+        .map_err(|error| self.transport_failure(error))?;
         let status = response.status();
         if !status.is_success() {
             let body = read_limited_body(response, MAX_ERROR_BODY_BYTES)
@@ -182,7 +186,13 @@ impl OllamaBackend {
         let mut stream = response.bytes_stream();
         let mut framer = NdjsonFramer::default();
         let mut completed = false;
-        while let Some(chunk) = stream.next().await {
+        loop {
+            let chunk = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| protocol_failure("the Ollama pull stream stalled".to_owned()))?;
+            let Some(chunk) = chunk else {
+                break;
+            };
             let chunk = chunk.map_err(|error| self.transport_failure(error))?;
             for line in framer.push(&chunk)? {
                 completed |= consume_pull_record(&line, &mut on_progress)?;
@@ -333,7 +343,10 @@ impl ChatBackend for OllamaBackend {
         let started_at = Instant::now();
         let url = self.endpoint("api/chat")?;
         let wire_request = ChatWireRequest::from(&request);
-        let send = self.client.post(url).json(&wire_request).send();
+        let send = tokio::time::timeout(
+            STREAM_START_TIMEOUT,
+            self.client.post(url).json(&wire_request).send(),
+        );
 
         let response = tokio::select! {
             () = cancellation.cancelled() => {
@@ -341,7 +354,14 @@ impl ChatBackend for OllamaBackend {
                 return Ok(receiver);
             }
             result = send => {
-                result.map_err(|error| self.transport_failure(error))?
+                match result {
+                    Ok(send) => send.map_err(|error| self.transport_failure(error))?,
+                    Err(_) => {
+                        return Err(protocol_failure(
+                            "timed out waiting for the Ollama response headers".to_owned(),
+                        ));
+                    }
+                }
             }
         };
 
@@ -375,6 +395,7 @@ impl ChatBackend for OllamaBackend {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn consume_chat_stream(
     response: Response,
     events: mpsc::Sender<ChatEvent>,
@@ -388,10 +409,24 @@ async fn consume_chat_stream(
     loop {
         let next = tokio::select! {
             () = cancellation.cancelled() => {
-                state.emit_terminal(ChatEvent::Cancelled).await;
+                state.emit_terminal(ChatEvent::Cancelled, &cancellation).await;
                 return;
             }
-            next = stream.next() => next,
+            result = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next()) => {
+                if let Ok(next) = result {
+                    next
+                } else {
+                    state
+                        .emit_terminal(
+                            ChatEvent::Failed(protocol_failure(
+                                "the Ollama response stream stalled".to_owned(),
+                            )),
+                            &cancellation,
+                        )
+                        .await;
+                    return;
+                }
+            }
         };
 
         match next {
@@ -402,30 +437,39 @@ async fn consume_chat_stream(
                             Ok(ConsumeLine::Done | ConsumeLine::ReceiverClosed) => return,
                             Ok(ConsumeLine::Continue) => {}
                             Ok(ConsumeLine::Cancelled) => {
-                                state.emit_terminal(ChatEvent::Cancelled).await;
+                                state
+                                    .emit_terminal(ChatEvent::Cancelled, &cancellation)
+                                    .await;
                                 return;
                             }
                             Err(failure) => {
-                                state.emit_terminal(ChatEvent::Failed(failure)).await;
+                                state
+                                    .emit_terminal(ChatEvent::Failed(failure), &cancellation)
+                                    .await;
                                 return;
                             }
                         }
                     }
                 }
                 Err(failure) => {
-                    state.emit_terminal(ChatEvent::Failed(failure)).await;
+                    state
+                        .emit_terminal(ChatEvent::Failed(failure), &cancellation)
+                        .await;
                     return;
                 }
             },
             Some(Err(error)) => {
                 state
-                    .emit_terminal(ChatEvent::Failed(BackendFailure {
-                        kind: BackendErrorKind::Unavailable,
-                        message: format!(
-                            "the Ollama response stream failed: {}",
-                            error.without_url()
-                        ),
-                    }))
+                    .emit_terminal(
+                        ChatEvent::Failed(BackendFailure {
+                            kind: BackendErrorKind::Unavailable,
+                            message: format!(
+                                "the Ollama response stream failed: {}",
+                                error.without_url()
+                            ),
+                        }),
+                        &cancellation,
+                    )
                     .await;
                 return;
             }
@@ -435,24 +479,33 @@ async fn consume_chat_stream(
                         Ok(ConsumeLine::Done | ConsumeLine::ReceiverClosed) => return,
                         Ok(ConsumeLine::Continue) => {}
                         Ok(ConsumeLine::Cancelled) => {
-                            state.emit_terminal(ChatEvent::Cancelled).await;
+                            state
+                                .emit_terminal(ChatEvent::Cancelled, &cancellation)
+                                .await;
                             return;
                         }
                         Err(failure) => {
-                            state.emit_terminal(ChatEvent::Failed(failure)).await;
+                            state
+                                .emit_terminal(ChatEvent::Failed(failure), &cancellation)
+                                .await;
                             return;
                         }
                     },
                     Ok(None) => {}
                     Err(failure) => {
-                        state.emit_terminal(ChatEvent::Failed(failure)).await;
+                        state
+                            .emit_terminal(ChatEvent::Failed(failure), &cancellation)
+                            .await;
                         return;
                     }
                 }
                 state
-                    .emit_terminal(ChatEvent::Failed(protocol_failure(
-                        "the Ollama response ended before done=true".to_owned(),
-                    )))
+                    .emit_terminal(
+                        ChatEvent::Failed(protocol_failure(
+                            "the Ollama response ended before done=true".to_owned(),
+                        )),
+                        &cancellation,
+                    )
                     .await;
                 return;
             }
@@ -560,12 +613,14 @@ impl ChatStreamState {
         }
     }
 
-    async fn emit_terminal(&self, event: ChatEvent) {
-        if matches!(&event, ChatEvent::Cancelled) {
-            let _ = self.events.try_send(event);
-        } else {
-            let _ = self.events.send(event).await;
-        }
+    async fn emit_terminal(&self, event: ChatEvent, cancellation: &CancellationToken) {
+        // Terminal events must never block forever on a full queue, even after
+        // cancellation: race the send against the cancellation token so a
+        // stalled consumer releases the producer.
+        let _ = tokio::select! {
+            () = cancellation.cancelled() => false,
+            result = self.events.send(event) => result.is_ok(),
+        };
     }
 }
 
@@ -598,12 +653,15 @@ impl NdjsonFramer {
         }
 
         if offset < bytes.len() {
-            self.buffer.extend_from_slice(&bytes[offset..]);
-            if self.buffer.len() > MAX_NDJSON_LINE_BYTES {
+            // Reject an oversized unterminated tail *before* growing the buffer,
+            // so a hostile or runaway stream cannot balloon memory unboundedly.
+            let tail = &bytes[offset..];
+            if self.buffer.len().saturating_add(tail.len()) > MAX_NDJSON_LINE_BYTES {
                 return Err(protocol_failure(format!(
                     "Ollama returned a stream record larger than {MAX_NDJSON_LINE_BYTES} bytes"
                 )));
             }
+            self.buffer.extend_from_slice(tail);
         }
         Ok(lines)
     }
@@ -1306,6 +1364,18 @@ mod tests {
                 .map(|message| message.content.as_str()),
             Some("脳")
         );
+    }
+
+    #[test]
+    fn framing_rejects_an_unterminated_tail_before_growing_the_buffer() {
+        let mut framer = NdjsonFramer::default();
+        // Push a partial record that leaves a large unterminated tail.
+        let oversized = vec![b'x'; MAX_NDJSON_LINE_BYTES + 1];
+        let error = framer
+            .push(&oversized)
+            .expect_err("an oversized unterminated tail must be rejected");
+        assert_eq!(error.kind, BackendErrorKind::Protocol);
+        assert!(framer.buffer.is_empty(), "no tail bytes should be buffered");
     }
 
     #[test]

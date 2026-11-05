@@ -321,9 +321,21 @@ pub fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
     let mut output = Vec::new();
     for line in lines {
         if line.spans.is_empty() {
-            output.push(Line::default());
+            output.push(line);
             continue;
         }
+
+        // Preserve the source line's own style and alignment so wrapped
+        // continuation rows keep the same color and justification.
+        let line_style = line.style;
+        let line_alignment = line.alignment;
+        let push_wrapped = |out: &mut Vec<Line<'static>>, spans: Vec<Span<'static>>| {
+            let mut wrapped = Line::from(spans).style(line_style);
+            if let Some(alignment) = line_alignment {
+                wrapped = wrapped.alignment(alignment);
+            }
+            out.push(wrapped);
+        };
 
         let mut current_spans = Vec::new();
         let mut current_width = 0usize;
@@ -341,7 +353,7 @@ pub fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
                     if !segment.is_empty() {
                         current_spans.push(Span::styled(std::mem::take(&mut segment), style));
                     }
-                    output.push(Line::from(std::mem::take(&mut current_spans)));
+                    push_wrapped(&mut output, std::mem::take(&mut current_spans));
                     current_width = 0;
                 }
 
@@ -350,7 +362,7 @@ pub fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
 
                 if current_width >= width {
                     current_spans.push(Span::styled(std::mem::take(&mut segment), style));
-                    output.push(Line::from(std::mem::take(&mut current_spans)));
+                    push_wrapped(&mut output, std::mem::take(&mut current_spans));
                     current_width = 0;
                 }
             }
@@ -361,13 +373,17 @@ pub fn wrap_lines(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
         }
 
         if !current_spans.is_empty() {
-            output.push(Line::from(current_spans));
+            push_wrapped(&mut output, current_spans);
         } else if current_width == 0
             && output
                 .last()
                 .is_none_or(|last: &Line<'_>| !last.spans.is_empty())
         {
-            output.push(Line::default());
+            let mut trailing = Line::default().style(line_style);
+            if let Some(alignment) = line_alignment {
+                trailing = trailing.alignment(alignment);
+            }
+            output.push(trailing);
         }
     }
     output

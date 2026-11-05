@@ -173,22 +173,37 @@ impl Storage {
         };
 
         let mut summaries = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
+        loop {
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "skipping an unreadable chat entry");
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
                 continue;
             }
             let parsed = match parse_session_file(&path).await {
                 Ok(parsed) => parsed,
-                Err(StorageError::UnsupportedSchema { .. } | StorageError::InvalidSession(_)) => {
+                Err(error) => {
+                    // A single broken or unreadable session must not hide every
+                    // other valid chat log or block startup.
+                    tracing::warn!(%error, path = %path.display(), "skipping an invalid chat entry");
                     continue;
                 }
-                Err(error) => return Err(error),
             };
-            let metadata = entry.metadata().await?;
-            let modified_at = metadata
-                .modified()
-                .map_or(parsed.session.created_at, DateTime::<Utc>::from);
+            let modified_at = match entry.metadata().await {
+                Ok(metadata) => metadata
+                    .modified()
+                    .map_or(parsed.session.created_at, DateTime::<Utc>::from),
+                Err(error) => {
+                    tracing::warn!(%error, path = %path.display(), "using session time for an unreadable chat entry");
+                    parsed.session.created_at
+                }
+            };
             summaries.push(SessionSummary {
                 id: parsed.session.id,
                 title: parsed.session.title(),
@@ -202,13 +217,51 @@ impl Storage {
     }
 
     pub async fn load_state(&self) -> Result<AppStateFile, StorageError> {
-        match fs::read_to_string(&self.paths.state).await {
-            Ok(contents) => serde_json::from_str(&contents).map_err(StorageError::Json),
+        let contents = match fs::read_to_string(&self.paths.state).await {
+            Ok(contents) => contents,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(AppStateFile::default());
+            }
+            Err(error) => return Err(StorageError::Io(error)),
+        };
+        match serde_json::from_str::<AppStateFile>(&contents) {
+            Ok(state) => Ok(state),
+            Err(error) => {
+                self.preserve_corrupt_state(&contents).await?;
+                tracing::warn!(
+                    %error,
+                    state = %self.paths.state.display(),
+                    "discarding corrupt state file and using defaults"
+                );
                 Ok(AppStateFile::default())
             }
-            Err(error) => Err(StorageError::Io(error)),
         }
+    }
+
+    /// Move a corrupt `state.json` aside under a unique `.corrupt` name so the
+    /// on-disk evidence is preserved without blocking subsequent startups.
+    async fn preserve_corrupt_state(&self, contents: &str) -> Result<(), StorageError> {
+        if contents.trim().is_empty() {
+            return Ok(());
+        }
+        // A timestamp plus UUID suffix keeps the backup unique even when two
+        // corruptions land in the same second.
+        let timestamp = Utc::now().format("%Y%m%d%H%M%S");
+        let suffix = Uuid::now_v7().simple().to_string();
+        let candidate = self
+            .paths
+            .state
+            .with_file_name(format!("state.json.{timestamp}.{suffix}.corrupt"));
+        if let Err(error) = fs::rename(&self.paths.state, &candidate).await {
+            tracing::warn!(
+                %error,
+                from = %self.paths.state.display(),
+                to = %candidate.display(),
+                "could not preserve corrupt state file"
+            );
+            return Err(StorageError::Io(error));
+        }
+        Ok(())
     }
 
     pub async fn save_state(&self, state: &AppStateFile) -> Result<(), StorageError> {
@@ -561,6 +614,90 @@ mod tests {
         assert_eq!(value["id"], message.id.to_string());
         assert_eq!(value["role"], "user");
         assert!(value.get("message").is_none());
+    }
+
+    #[tokio::test]
+    async fn corrupt_state_is_preserved_and_defaults_are_returned() {
+        let (_temporary, storage) = test_storage().await;
+        fs::write(&storage.paths().state, b"{not valid json\n")
+            .await
+            .unwrap();
+
+        let state = storage.load_state().await.unwrap();
+        assert!(state.last_model.is_none());
+        assert!(state.recent_session.is_none());
+
+        // The original file is moved aside, not silently deleted.
+        assert!(!storage.paths().state.exists());
+        let corrupt_entries: Vec<_> = std::fs::read_dir(&storage.paths().root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("state.json.")
+                    && entry.file_name().to_string_lossy().ends_with(".corrupt")
+            })
+            .collect();
+        assert_eq!(
+            corrupt_entries.len(),
+            1,
+            "one .corrupt backup should be kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncated_state_is_preserved_and_defaults_are_returned() {
+        let (_temporary, storage) = test_storage().await;
+        fs::write(&storage.paths().state, b"{\"last_model\": \"qwen\"")
+            .await
+            .unwrap();
+
+        let state = storage.load_state().await.unwrap();
+        assert!(state.last_model.is_none());
+        assert!(!storage.paths().state.exists());
+    }
+
+    #[tokio::test]
+    async fn a_broken_chat_entry_does_not_hide_valid_sessions() {
+        let (_temporary, storage) = test_storage().await;
+        let session = storage.create_session().await.unwrap();
+        storage
+            .append_message(session.id, &ChatMessage::user("valid session"))
+            .await
+            .unwrap();
+
+        // A non-JSON chat file that would previously abort the entire listing.
+        fs::write(storage.paths().chats.join("broken.jsonl"), b"not-json\n")
+            .await
+            .unwrap();
+
+        let summaries = storage.list_sessions().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].title, "valid session");
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_chat_entry_does_not_hide_valid_sessions() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_temporary, storage) = test_storage().await;
+        let session = storage.create_session().await.unwrap();
+        storage
+            .append_message(session.id, &ChatMessage::user("still listed"))
+            .await
+            .unwrap();
+
+        let broken = storage
+            .paths()
+            .chats
+            .join("00000000-0000-0000-0000-000000000000.jsonl");
+        fs::write(&broken, b"garbage").await.unwrap();
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let summaries = storage.list_sessions().await.unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].title, "still listed");
     }
 
     #[tokio::test]

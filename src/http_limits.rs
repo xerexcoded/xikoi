@@ -14,6 +14,16 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 /// Total budget for non-streaming health, listing, and metadata calls.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Budget for a streaming backend to send its response headers and the first
+/// body bytes after a request is accepted. Generous so slow cold loads are not
+/// cut off, but bounded so a dead endpoint cannot hold the UI open forever.
+pub const STREAM_START_TIMEOUT: Duration = Duration::from_mins(1);
+
+/// Maximum gap allowed between successive bytes of a streaming response.
+/// Resets on every received chunk, so a long-running but live inference is
+/// never capped while a silently stalled connection fails promptly.
+pub const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Maximum JSON or transcription payload that may be buffered.
 pub const MAX_JSON_BODY_BYTES: usize = 16 * 1024 * 1024;
 

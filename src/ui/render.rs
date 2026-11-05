@@ -456,12 +456,13 @@ fn resolve_transcript_scroll(
     if scroll.follow_tail {
         return anchors.len().saturating_sub(viewport_rows);
     }
+    let maximum = anchors.len().saturating_sub(viewport_rows);
     if let Some(anchor) = scroll.anchor
         && let Some(position) = anchors
             .iter()
             .position(|row| row.is_some_and(|row| row == anchor))
     {
-        return position;
+        return position.min(maximum);
     }
     if let Some(anchor) = scroll.anchor
         && let Some((position, _)) = anchors
@@ -474,12 +475,9 @@ fn resolve_transcript_scroll(
             })
             .min_by_key(|(_, row)| row.row_in_message.abs_diff(anchor.row_in_message))
     {
-        return position;
+        return position.min(maximum);
     }
-    anchors
-        .len()
-        .saturating_sub(viewport_rows)
-        .saturating_sub(scroll.offset_from_tail)
+    maximum.saturating_sub(scroll.offset_from_tail)
 }
 
 fn transcript_content_size(screen: Size) -> Option<(u16, u16)> {
@@ -855,9 +853,9 @@ fn render_overlay(
     let (title, maximum_height) = match overlay {
         OverlayView::Models { .. } => (" MODEL MATRIX ", 18),
         OverlayView::Sessions { .. } => (" SESSION ARCHIVE ", 18),
-        OverlayView::Help { .. } => (" COMMAND LEXICON ", 18),
+        OverlayView::Help { .. } => (" COMMAND LEXICON ", 20),
         OverlayView::Audio { .. } => (" AUDIO MATRIX // CORE AUDIO ", 20),
-        OverlayView::Inspector => (" SYSTEM INSPECTOR ", 20),
+        OverlayView::Inspector => (" SYSTEM INSPECTOR ", 24),
     };
     let popup = centered_popup(area, 76, maximum_height);
     if popup.is_empty() {

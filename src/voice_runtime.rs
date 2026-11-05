@@ -182,27 +182,33 @@ impl VoiceRuntime {
         make_private_directory(logs)?;
         let log = open_private_append(&logs.join("voice-server.log"))?;
         let error_log = log.try_clone()?;
-        let mut child = server_command(self, &endpoint)
-            .stdin(Stdio::null())
-            .stdout(Stdio::from(log))
-            .stderr(Stdio::from(error_log))
-            .spawn()?;
+        // Wrap the child in its cleanup guard immediately after spawn so any
+        // early return below (including a `?` on `try_wait`) still reaps the
+        // process instead of leaking it.
+        let mut child = ManagedVoiceServer {
+            child: server_command(self, &endpoint)
+                .stdin(Stdio::null())
+                .stdout(Stdio::from(log))
+                .stderr(Stdio::from(error_log))
+                .spawn()?,
+        };
 
         let deadline = Instant::now() + SERVER_START_TIMEOUT;
         let mut last_error = "server did not answer its health check".to_owned();
         while Instant::now() < deadline {
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = child.child.try_wait()? {
+                let _ = child.child.wait();
                 return Err(VoiceRuntimeError::ServerExited(status.code()));
             }
             match client.probe().await {
-                Ok(_) => return Ok(Some(ManagedVoiceServer { child })),
+                Ok(_) => return Ok(Some(child)),
                 Err(error) => last_error = error.to_string(),
             }
             sleep(Duration::from_millis(250)).await;
         }
 
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = child.child.kill();
+        let _ = child.child.wait();
         Err(VoiceRuntimeError::ServerStartTimeout(last_error))
     }
 
@@ -254,7 +260,9 @@ struct LocalEndpoint {
 
 fn local_endpoint(url: &Url) -> Result<LocalEndpoint, VoiceRuntimeError> {
     if url.scheme() != "http" {
-        return Err(VoiceRuntimeError::NonLocalSpeechUrl(url.clone()));
+        return Err(VoiceRuntimeError::NonLocalSpeechUrl(
+            crate::config::redact_endpoint(url),
+        ));
     }
     let host = match url.host() {
         Some(Host::Domain(host)) if host.eq_ignore_ascii_case("localhost") => {
@@ -262,10 +270,16 @@ fn local_endpoint(url: &Url) -> Result<LocalEndpoint, VoiceRuntimeError> {
         }
         Some(Host::Ipv4(address)) if IpAddr::V4(address).is_loopback() => address.to_string(),
         Some(Host::Ipv6(address)) if IpAddr::V6(address).is_loopback() => address.to_string(),
-        _ => return Err(VoiceRuntimeError::NonLocalSpeechUrl(url.clone())),
+        _ => {
+            return Err(VoiceRuntimeError::NonLocalSpeechUrl(
+                crate::config::redact_endpoint(url),
+            ));
+        }
     };
     if !matches!(url.path(), "" | "/") || url.query().is_some() {
-        return Err(VoiceRuntimeError::NonLocalSpeechUrl(url.clone()));
+        return Err(VoiceRuntimeError::NonLocalSpeechUrl(
+            crate::config::redact_endpoint(url),
+        ));
     }
     Ok(LocalEndpoint {
         host,
@@ -282,6 +296,7 @@ fn server_command(runtime: &VoiceRuntime, endpoint: &LocalEndpoint) -> Command {
         .arg(endpoint.port.to_string())
         .current_dir(runtime.root())
         .env("HF_HUB_DISABLE_TELEMETRY", "1")
+        .env("HF_HUB_OFFLINE", "1")
         .env("TOKENIZERS_PARALLELISM", "false");
     command
 }
@@ -350,7 +365,7 @@ pub enum VoiceRuntimeError {
     #[error("the MLX-Audio runtime is incomplete under {0}")]
     IncompleteInstallation(PathBuf),
     #[error("managed MLX-Audio requires a loopback HTTP URL, not {0}")]
-    NonLocalSpeechUrl(Url),
+    NonLocalSpeechUrl(String),
     #[error("{command} failed with status {status:?}")]
     CommandFailed {
         command: String,

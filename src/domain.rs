@@ -68,14 +68,23 @@ impl Usage {
         Some((count as f64) * 1_000_000_000.0 / duration as f64)
     }
 
+    /// Total context occupancy: prompt tokens plus generated tokens, with
+    /// saturating arithmetic so two near-`u64::MAX` counts cannot wrap around.
+    pub fn context_occupied(&self) -> Option<u64> {
+        match (self.prompt_eval_count, self.eval_count) {
+            (None, None) => None,
+            (prompt, generated) => Some(prompt.unwrap_or(0).saturating_add(generated.unwrap_or(0))),
+        }
+    }
+
     #[allow(clippy::cast_precision_loss)]
     pub fn context_ratio(&self, allocated_context: Option<u64>) -> Option<f64> {
-        let prompt = self.prompt_eval_count?;
+        let used = self.context_occupied()?;
         let context = allocated_context?;
         if context == 0 {
             return None;
         }
-        Some((prompt as f64 / context as f64).clamp(0.0, 1.0))
+        Some((used as f64 / context as f64).clamp(0.0, 1.0))
     }
 
     pub fn total_duration(&self) -> Option<Duration> {
@@ -251,6 +260,38 @@ mod tests {
             ..Usage::default()
         };
         assert_eq!(zero.output_tokens_per_second(), None);
+    }
+
+    #[test]
+    fn context_occupancy_sums_prompt_and_generated_with_saturation() {
+        let usage = Usage {
+            prompt_eval_count: Some(10),
+            eval_count: Some(5),
+            ..Usage::default()
+        };
+        assert_eq!(usage.context_occupied(), Some(15));
+
+        let prompt_only = Usage {
+            prompt_eval_count: Some(7),
+            ..Usage::default()
+        };
+        assert_eq!(prompt_only.context_occupied(), Some(7));
+
+        let generated_only = Usage {
+            eval_count: Some(3),
+            ..Usage::default()
+        };
+        assert_eq!(generated_only.context_occupied(), Some(3));
+
+        // Saturating arithmetic must not wrap around near u64::MAX.
+        let near_max = Usage {
+            prompt_eval_count: Some(u64::MAX),
+            eval_count: Some(u64::MAX),
+            ..Usage::default()
+        };
+        assert_eq!(near_max.context_occupied(), Some(u64::MAX));
+
+        assert_eq!(Usage::default().context_occupied(), None);
     }
 
     #[test]

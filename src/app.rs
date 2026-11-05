@@ -25,8 +25,9 @@ use crate::{
     backend::ChatBackend,
     config::{AppStateFile, BackendKind, RuntimeConfig},
     domain::{
-        BackendFailure, BackendInfo, ChatEvent, ChatMessage, ChatRequest, GenerationOptions,
-        MessageOrigin, MessageStatus, ModelDetails, ModelSummary, SelectedModel, Usage,
+        BackendErrorKind, BackendFailure, BackendInfo, ChatEvent, ChatMessage, ChatRequest,
+        GenerationOptions, MessageOrigin, MessageStatus, ModelDetails, ModelSummary, Role,
+        SelectedModel, Usage,
     },
     speech::{
         MlxAudioClient, SpeechFailure, SpeechServerInfo, SynthesisRequest, TranscriptionRequest,
@@ -156,6 +157,13 @@ impl App {
         let sessions = storage.list_sessions().await?;
         let (session, initial_status) =
             resolve_startup_session(&storage, &config, &mut persisted).await?;
+        // Restore the most recent usage metrics when resuming an existing
+        // session so the telemetry gauge is populated before the next turn.
+        let last_usage = session
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| message.usage.clone());
         let (internal_tx, internal_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         let speech = Arc::new(
             MlxAudioClient::new(config.speech.url.clone())
@@ -204,7 +212,7 @@ impl App {
             input_signal_samples: VecDeque::from(vec![0; SIGNAL_CAPACITY]),
             user_scope_samples: Vec::new(),
             ai_scope_samples: Vec::new(),
-            last_usage: None,
+            last_usage,
             streaming_message: None,
             generation_started: None,
             generation_cancel: None,
@@ -490,9 +498,8 @@ impl App {
             },
             backend_version: self.backend_info.as_ref().map(|info| info.version.as_str()),
             session: Some(session_id),
-            context_used: usage.and_then(|item| item.prompt_eval_count),
-            context_limit: selected
-                .and_then(|model| model.allocated_context.or(model.maximum_context)),
+            context_used: usage.and_then(Usage::context_occupied),
+            context_limit: selected.and_then(|model| model.allocated_context),
             prompt_tokens: usage.and_then(|item| item.prompt_eval_count),
             generated_tokens: usage.and_then(|item| item.eval_count),
             tokens_per_second: usage.and_then(Usage::output_tokens_per_second),
@@ -532,6 +539,13 @@ impl App {
         }
 
         if self.overlay.is_some() {
+            // Overlays are not drawn in the too-small layout; routing input to
+            // an invisible modal would leave the user acting on hidden state.
+            if ui::layout_class(self.terminal_size) == ui::LayoutClass::TooSmall {
+                self.overlay = None;
+                self.dirty = true;
+                return Ok(());
+            }
             return self.handle_overlay_key(key).await;
         }
 
@@ -546,7 +560,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('l') => return self.new_session().await,
-                KeyCode::Char('n') => {
+                KeyCode::Char('n') if !self.voice_mode => {
                     self.input.input(Input {
                         key: Key::Enter,
                         ctrl: false,
@@ -600,8 +614,9 @@ impl App {
                 self.dirty = true;
             }
             KeyCode::Enter
-                if key.modifiers.contains(KeyModifiers::ALT)
-                    || key.modifiers.contains(KeyModifiers::SHIFT) =>
+                if !self.voice_mode
+                    && (key.modifiers.contains(KeyModifiers::ALT)
+                        || key.modifiers.contains(KeyModifiers::SHIFT)) =>
             {
                 self.input.input(Input {
                     key: Key::Enter,
@@ -612,7 +627,7 @@ impl App {
                 self.pulse_input(16);
                 self.dirty = true;
             }
-            KeyCode::Enter => self.send_message().await?,
+            KeyCode::Enter if !self.voice_mode => self.send_message().await?,
             _ if !self.voice_mode => {
                 self.input.input(key);
                 self.pulse_input(8);
@@ -668,6 +683,9 @@ impl App {
                 self.backend_info = Some(info);
                 self.link = LinkState::Online;
                 self.models = visible_models(models, self.config.allow_cloud_models);
+                // The refreshed list may be shorter; clamp the overlay cursor so
+                // Enter keeps selecting the same highlighted model.
+                self.overlay_index = self.overlay_index.min(self.models.len().saturating_sub(1));
                 self.status = None;
 
                 match choose_startup_model(
@@ -763,6 +781,10 @@ impl App {
                     }
                     Err(error) => {
                         self.speech_online = false;
+                        // The speech server is gone: tear down any in-flight
+                        // capture or playback so the microphone cannot keep
+                        // recording while the UI reports DISARMED.
+                        self.cancel_voice();
                         if self.voice_mode {
                             self.voice_state = VoiceState::Disarmed;
                             self.status =
@@ -782,12 +804,16 @@ impl App {
                 self.voice_cancel = None;
                 match result {
                     Ok(text) => {
-                        if self.model_hydration_pending {
+                        // Never drop a valid transcription. If metadata is still
+                        // loading or the previous generation is still finishing
+                        // its cancellation, park the text in the composer where
+                        // the user can send it once the link is free.
+                        if self.model_hydration_pending || self.generation_cancel.is_some() {
                             self.input.insert_str(&text);
                             self.voice_state = VoiceState::Ready;
                             self.activity = ActivityState::Idle;
                             self.status = Some(
-                                "VOICE DECODED // kept in composer while model metadata loads"
+                                "VOICE DECODED // kept in composer while the link is busy"
                                     .to_owned(),
                             );
                             self.dirty = true;
@@ -901,6 +927,10 @@ impl App {
                     && let Some(response) = spoken_response
                 {
                     self.start_synthesis(&response);
+                } else if self.voice_mode {
+                    // A completed answer with no speakable content has nothing to
+                    // synthesize; return the deck to a ready state.
+                    self.voice_state = VoiceState::Ready;
                 }
             }
             ChatEvent::Failed(error) => {
@@ -1044,9 +1074,25 @@ impl App {
         user.origin = origin;
         self.storage.append_message(self.session.id, &user).await?;
         self.session.messages.push(user);
+        // Failed and cancelled assistant placeholders carry no authoritative
+        // model output; exclude them from the outgoing history so the model
+        // never reasons over its own aborted or errored turns.
+        let history: Vec<_> = self
+            .session
+            .messages
+            .iter()
+            .filter(|message| {
+                !(message.role == Role::Assistant
+                    && matches!(
+                        message.status,
+                        MessageStatus::Failed | MessageStatus::Cancelled
+                    ))
+            })
+            .cloned()
+            .collect();
         let request = ChatRequest {
             model: model_name.clone(),
-            messages: self.session.messages.clone(),
+            messages: history,
             options: GenerationOptions {
                 keep_alive: self.config.keep_alive.clone(),
             },
@@ -1152,6 +1198,11 @@ impl App {
         } else {
             VoiceState::Disarmed
         };
+        // Clear stale streaming/failed activity so a cancelled voice operation
+        // does not leave the deck reporting AI SPEAKING or VOICE ERROR.
+        if self.generation_cancel.is_none() && self.activity != ActivityState::Failed {
+            self.activity = ActivityState::Idle;
+        }
         self.dirty = true;
     }
 
@@ -1545,6 +1596,23 @@ impl App {
         let Some(device) = device else {
             return Ok(());
         };
+        // Refuse to re-route while a stream on that direction is live, so the
+        // displayed device can never diverge from the one actually in use.
+        let stream_active = match device.direction {
+            AudioDirection::Input => self.capture.is_some(),
+            AudioDirection::Output => self.playback.is_some(),
+        };
+        if stream_active {
+            let label = match device.direction {
+                AudioDirection::Input => "MIC",
+                AudioDirection::Output => "OUTPUT",
+            };
+            self.status = Some(format!(
+                "{label} BUSY // stop the active stream before re-routing"
+            ));
+            self.dirty = true;
+            return Ok(());
+        }
         match device.direction {
             AudioDirection::Input => self.persisted.input_device_id = Some(device.id.clone()),
             AudioDirection::Output => self.persisted.output_device_id = Some(device.id.clone()),
@@ -1596,6 +1664,7 @@ impl App {
         if self.generation_cancel.is_some() {
             self.status = Some("CANCEL GENERATION BEFORE SWITCHING MODELS".to_owned());
             self.overlay = None;
+            self.dirty = true;
             return Ok(());
         }
         let Some(summary) = self.models.get(index).cloned() else {
@@ -1608,6 +1677,7 @@ impl App {
         }
         if summary.is_cloud() && !self.config.allow_cloud_models {
             self.status = Some("CLOUD MODEL BLOCKED // enable explicitly in config".to_owned());
+            self.dirty = true;
             return Ok(());
         }
         let model_changed = self
@@ -1625,6 +1695,9 @@ impl App {
             summary: summary.clone(),
             ..SelectedModel::default()
         });
+        // Usage metrics belong to the previously selected model; drop them so
+        // the gauge cannot show stale tokens beside the new selection.
+        self.last_usage = None;
         self.persisted.last_model = Some(summary.name.clone());
         self.storage.save_state(&self.persisted).await?;
         self.overlay = None;
@@ -1637,6 +1710,7 @@ impl App {
         if self.generation_cancel.is_some() {
             self.status = Some("CANCEL GENERATION BEFORE SWITCHING SESSIONS".to_owned());
             self.overlay = None;
+            self.dirty = true;
             return Ok(());
         }
         let Some(summary) = self.sessions.get(index) else {
@@ -1734,8 +1808,19 @@ async fn forward_chat_events(
             return;
         }
     }
-    if cancellation.is_cancelled() && !terminal_event_forwarded {
-        let _ = events.send(InternalEvent::Chat(ChatEvent::Cancelled)).await;
+    // The backend receiver closed without a terminal event. Synthesize one so
+    // the app can never leave generation permanently locked: cancellation wins,
+    // otherwise report a protocol failure.
+    if !terminal_event_forwarded {
+        let event = if cancellation.is_cancelled() {
+            ChatEvent::Cancelled
+        } else {
+            ChatEvent::Failed(BackendFailure {
+                kind: BackendErrorKind::Protocol,
+                message: "the chat stream closed without a terminal event".to_owned(),
+            })
+        };
+        let _ = events.send(InternalEvent::Chat(event)).await;
     }
 }
 
@@ -2372,6 +2457,46 @@ mod tests {
                 .as_deref()
                 .is_some_and(|status| status.starts_with("MODEL SELECTED"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_receiver_that_closes_without_a_terminal_event_is_synthesized_as_failed() {
+        let (backend_events, backend_receiver) = mpsc::channel(1);
+        backend_events
+            .send(ChatEvent::ContentDelta("partial".to_owned()))
+            .await
+            .unwrap();
+        let (app_events, mut app_receiver) = mpsc::channel(1);
+        let forwarder = tokio::spawn(forward_chat_events(
+            backend_receiver,
+            app_events,
+            CancellationToken::new(),
+        ));
+        drop(backend_events);
+
+        let Some(InternalEvent::Chat(event)) = app_receiver.recv().await else {
+            panic!("expected the queued content event");
+        };
+        assert_eq!(event, ChatEvent::ContentDelta("partial".to_owned()));
+
+        // The receiver closed without a terminal event and cancellation was
+        // never requested; the forwarder must synthesize a failure so the app
+        // cannot leave generation permanently locked.
+        let Some(InternalEvent::Chat(event)) =
+            tokio::time::timeout(Duration::from_secs(1), app_receiver.recv())
+                .await
+                .unwrap()
+        else {
+            panic!("expected the synthesized failure event");
+        };
+        assert!(matches!(
+            event,
+            ChatEvent::Failed(BackendFailure {
+                kind: BackendErrorKind::Protocol,
+                ..
+            })
+        ));
+        forwarder.await.unwrap();
     }
 
     #[tokio::test]
